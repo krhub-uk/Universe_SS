@@ -6,3 +6,4 @@ __pycache__/
 Archive/
 Outputs/
 Inputs/
+*.log
