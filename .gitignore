@@ -1,0 +1,5 @@
+.env
+*.xlsm
+Cowork/
+__pycache__/
+*.pyc
