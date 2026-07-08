@@ -3,3 +3,6 @@
 Cowork/
 __pycache__/
 *.pyc
+Archive/
+Outputs/
+Inputs/
