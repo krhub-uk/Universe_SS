@@ -108,7 +108,84 @@ All cron jobs run via wrapper `.sh` scripts — never inline commands. Each wrap
 
 ---
 
-## Running manually
+## TradingView Watchlists
+
+### How it works
+
+`sync_engine_tv.py` reads the **local workbook** on the Ubuntu server — it does **not** pull from GDrive before running. This means:
+
+> **Always run a fetch script first, or manually trigger a GDrive pull, before generating watchlists.** Otherwise the `.txt` files will reflect whatever version of the workbook is currently on the server, which may be stale.
+
+The safest sequence:
+```bash
+bash /opt/dev/universe_SS/run_weekly.sh   # fetches + derives + pushes to GDrive
+python3 /opt/dev/universe_SS/sync_engine_tv.py   # then generate watchlists
+```
+
+Or if you just want watchlists from the current server copy without a full fetch:
+```bash
+python3 /opt/dev/universe_SS/sync_engine_tv.py   # uses whatever .xlsm is on server now
+```
+
+After generation, `.txt` files are rclone'd automatically to `gdrive:Claude/TradingUniverse/Watchlists/TV/`.
+
+---
+
+### Columns used
+
+| Column | Type | Values | Role |
+|---|---|---|---|
+| `M_Eliminated` | Fixed | `No Touch` / blank | Kill switch — `No Touch` excludes ticker from all watchlists, checked first |
+| `M_Export_TV` | Variable | Any string / `N` | Free-text watchlist name. `N` = exclude. Value becomes the `.txt` filename. |
+| `M_Sleeve_Watchlist` | Fixed | `Y` / blank | `Y` = include this ticker in an auto-generated watchlist named after its `M_Sleeve` value |
+| `M_Universe_Watchlist` | Fixed | `Y` / blank | `Y` = include in auto-generated watchlist named after its `M_Universe` value |
+| `M_Div_Coupon_Class_Watchlist` | Fixed | `Y` / blank | `Y` = include in auto-generated watchlist named after its `M_Div_Coupon_Class` value |
+| `M_Related_To` | Variable | Any string | Section label within a watchlist file. Distinct values become `####SECTION` headers. No fixed set — whatever is in the column is used. Never controls inclusion/exclusion. |
+| `S_TV_Ticker` | Variable | TradingView ticker string | The value written into the `.txt` file. Falls back to `M_Ticker` if blank. |
+
+### Two independent mechanisms
+
+**1. Free-text routing** (`M_Export_TV`):
+- Populate with a literal watchlist name (e.g. `Core`, `Portfolio`, `Growth`)
+- Same ticker can appear in multiple watchlists with different names
+- Set to `N` to exclude from this mechanism entirely
+
+**2. Boolean-flag auto-derivation** (three columns):
+- `M_Sleeve_Watchlist = Y` → generates one `.txt` per distinct `M_Sleeve` value (e.g. `DIV_CORE.txt`, `GROWTH.txt`)
+- `M_Universe_Watchlist = Y` → generates one `.txt` per distinct `M_Universe` value
+- `M_Div_Coupon_Class_Watchlist = Y` → generates one `.txt` per distinct `M_Div_Coupon_Class` value (e.g. `Aristocrat_King.txt`)
+
+Both mechanisms run on every execution. A ticker can appear in many watchlists simultaneously — this is by design.
+
+### Section headers within each file
+
+Tickers within a watchlist are grouped by their `M_Related_To` value. Example output:
+
+```
+####XLK
+NASDAQ:AAPL
+NASDAQ:MSFT
+####XLF
+NYSE:JPM
+NYSE:BAC
+####Other
+LSE:HLMA
+```
+
+Tickers with no `M_Related_To` value land in `####Other` at the end.
+
+### Output
+
+```
+/opt/dev/universe_SS/Output/TV/
+  Core.txt
+  Portfolio.txt
+  DIV_CORE.txt
+  Aristocrat_King.txt
+  ...
+```
+
+Files are overwritten on every run. Upload whichever files you need to TradingView via the "Upload list…" button — daily-use watchlists and weekend-analysis watchlists are separate human choices at upload time.
 
 ```bash
 # Run any script directly

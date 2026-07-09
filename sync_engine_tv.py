@@ -110,17 +110,17 @@ def build_watchlists(ws, headers):
         section   = get(row, 'M_Related_To') or 'Other'
 
         # ── Mechanism 1: free-text routing ────────────────────────────────
+        # N = exclude from free-text only. Y = no named watchlist (boolean flags handle it).
+        # Any other string = literal watchlist name.
+        # M_Export_TV does NOT gate Mechanism 2 — the two mechanisms are independent.
         export_tv = get(row, 'M_Export_TV')
-        if export_tv and str(export_tv).strip().upper() != 'N':
-            wl_name = str(export_tv).strip()
-            if wl_name == 'Y':
-                log.warning(
-                    f"{ticker_raw}: M_Export_TV='Y' — treating as watchlist named 'Y'. "
-                    f"Populate with a literal watchlist name if different behaviour intended."
-                )
-            watchlists[wl_name][section].append(tv_ticker)
+        export_tv_str = str(export_tv).strip().upper() if export_tv else ''
+        if export_tv_str not in ('', 'N', 'Y'):
+            watchlists[str(export_tv).strip()][section].append(tv_ticker)
 
         # ── Mechanism 2: boolean-flag auto-derivation ─────────────────────
+        # Runs for ALL non-eliminated tickers — independent of M_Export_TV.
+        # Each flag column independently controls inclusion in its derived watchlist.
         for flag_col, source_col in available_flags.items():
             flag_val = get(row, flag_col)
             if str(flag_val).strip().upper() == 'Y':
@@ -132,24 +132,28 @@ def build_watchlists(ws, headers):
 
 
 def write_watchlist_file(name, sections, output_dir):
-    """Write one .txt file for a watchlist, grouped by section."""
+    """Write one .txt file for a watchlist, grouped by section. Deduplicates tickers globally."""
     filename = safe_filename(name) + ".txt"
     filepath = os.path.join(output_dir, filename)
 
     lines = []
-    # Write named sections first, 'Other' last
+    seen = set()  # deduplicate across AND within all sections in this file
     ordered = sorted(sections.keys(), key=lambda s: (s == 'Other', s))
     for section in ordered:
-        tickers = sections[section]
-        if not tickers:
+        section_tickers = []
+        for t in sections[section]:
+            if t not in seen:
+                section_tickers.append(t)
+                seen.add(t)  # update immediately to catch within-section dupes
+        if not section_tickers:
             continue
         lines.append(f"####{section}")
-        lines.extend(tickers)
+        lines.extend(section_tickers)
 
     with open(filepath, 'w') as f:
         f.write('\n'.join(lines) + '\n')
 
-    return filepath, len(lines)
+    return filepath, len(seen)
 
 
 def run():
@@ -171,6 +175,15 @@ def run():
         log.warning("No watchlists generated — check M_Export_TV values and flag columns.")
     else:
         log.info(f"Watchlists to generate: {sorted(watchlists.keys())}")
+
+    # Clear output folder before writing — removes stale files from previous runs
+    # (prevents case variants like Core.txt + CORE.txt coexisting)
+    import glob
+    stale = glob.glob(os.path.join(OUTPUT_DIR, "*.txt"))
+    for f in stale:
+        os.remove(f)
+    if stale:
+        log.info(f"Cleared {len(stale)} stale file(s) from output folder")
 
     total_files = 0
     total_tickers = 0
