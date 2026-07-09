@@ -66,6 +66,17 @@ source "$BASE_DIR/venv/bin/activate"
 python3 "$BASE_DIR/fetch_engine_weekly.py" >> "$LOG_FILE" 2>&1
 SCRIPT_EXIT=$?
 
+if [ $SCRIPT_EXIT -eq 0 ]; then
+    python3 "$BASE_DIR/derive_engine.py" >> "$LOG_FILE" 2>&1
+    SCRIPT_EXIT=$?
+fi
+
+
+
+
+
+SCRIPT_EXIT=$?
+
 # 8. End timestamp + elapsed
 END_TS=$(date '+%Y-%m-%d %H:%M:%S')
 END_EPOCH=$(date +%s)
