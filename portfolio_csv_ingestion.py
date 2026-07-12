@@ -31,7 +31,7 @@ HL append dedup: before appending a row to DIVIDENDS or
 PORTFOLIO_TRANSACTIONS, a composite key is checked against rows already in
 the sheet (and against rows appended earlier in the same run). Matches are
 skipped silently -- re-ingesting the same export doesn't double the ledger.
-    DIVIDENDS key:               date + ticker + amount
+    DIVIDENDS key:               date + description + amount
     PORTFOLIO_TRANSACTIONS key:  date + ticker + transaction type + amount
 Neither CSV carries a ticker column, so "ticker" in these keys is whatever
 the sheet's Ticker column holds for that row (blank for a fresh append,
@@ -162,6 +162,7 @@ HL_MATCH_FILES = {
         "source_key": "Code",
         "dest_key": "Code",
         "column_map": {
+            "Stock":         "Stock",
             "Price (pence)": "Price (pence)",
             "Value (£)":     "Value (£)",
             "Cost (£)":      "Cost (£)",
@@ -583,8 +584,12 @@ def transaction_type_from_reference(reference):
     return ref.upper()
 
 
-def dividend_key(date_val, ticker_val, amount_val):
-    return (_normalize_date(date_val), _normalize_ticker(ticker_val), _normalize_amount(amount_val))
+def dividend_key(date_val, description_val, amount_val):
+    # Sprint 3: key uses description instead of ticker. Ticker is blank at
+    # append time (enrichment runs after), so ticker-based dedup always missed
+    # and caused duplicates on re-ingestion of the same export.
+    desc = str(description_val or "").strip()
+    return (_normalize_date(date_val), desc, _normalize_amount(amount_val))
 
 
 def transaction_key(date_val, ticker_val, reference_val, amount_val):
@@ -600,16 +605,18 @@ def existing_append_keys(ws, headers, sheet_name):
     """Composite keys already present in the sheet, per §-defined dedup rule."""
     keys = set()
     if sheet_name == "DIVIDENDS":
-        date_c, ticker_c, amount_c = headers.get("Date"), headers.get("Ticker"), headers.get("Amount")
+        date_c = headers.get("Date")
+        desc_c = headers.get("Description")
+        amount_c = headers.get("Amount")
         if not (date_c and amount_c):
             return keys
         for row_idx in range(2, ws.max_row + 1):
             d = ws.cell(row=row_idx, column=date_c).value
-            t = ws.cell(row=row_idx, column=ticker_c).value if ticker_c else None
+            desc = ws.cell(row=row_idx, column=desc_c).value if desc_c else None
             a = ws.cell(row=row_idx, column=amount_c).value
             if d is None and a is None:
                 continue
-            keys.add(dividend_key(d, t, a))
+            keys.add(dividend_key(d, desc, a))
     elif sheet_name == "PORTFOLIO_TRANSACTIONS":
         date_c = headers.get("Trade date")
         ticker_c = headers.get("Ticker")
@@ -631,7 +638,7 @@ def existing_append_keys(ws, headers, sheet_name):
 def key_for_incoming_row(sheet_name, row):
     """row: a CSV DictReader row (raw strings)."""
     if sheet_name == "DIVIDENDS":
-        return dividend_key(row.get("Date"), row.get("Ticker"), row.get("Amount"))
+        return dividend_key(row.get("Date"), row.get("Description"), row.get("Amount"))
     if sheet_name == "PORTFOLIO_TRANSACTIONS":
         return transaction_key(
             row.get("Trade date"), row.get("Ticker"), row.get("Reference"), row.get("Value (£)")
