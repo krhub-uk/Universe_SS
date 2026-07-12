@@ -46,140 +46,121 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── QScore helpers ────────────────────────────────────────────────────────────
+# ── QScore v2 helpers ─────────────────────────────────────────────────────────
+# Sprint 3: QScore v2 replaces the prior 4-component weighted model.
+# 4 inputs, equal weight, averaged. Any blank input → Insufficient Data.
+# Eligibility: M_Eliminated ≠ No Touch, M_Asset_Type ≠ ETF,
+# M_Div_Coupon_Class ∈ QSCORE_V2_ELIGIBLE_CLASSES.
 
-ELIGIBLE_CLASSES = {"Aristocrat_King", "Aristocrat", "Achiever", "Contender",
-                    "HighIncome", "MedIncome"}
-
-STREAK_PROXY = {
-    "Aristocrat_King": 100,
-    "Aristocrat":      100,
-    "Achiever":         50,
-    "Contender":        50,
-    "HighIncome":        0,
-    "MedIncome":         0,
+QSCORE_V2_ELIGIBLE_CLASSES = {
+    "Aristocrat_King", "Aristocrat", "Achiever", "Contender",
+    "HighIncome", "MedIncome", "LowNoIncome",
 }
 
 SLEEVE_STREAK_TIERS = {"Aristocrat_King", "Aristocrat", "Achiever", "Contender"}
 
+# Streak proxy scores (input 1)
+STREAK_PROXY_V2 = {
+    "Aristocrat_King": 100,
+    "Aristocrat":       80,
+    "Achiever":         60,
+    "Contender":        50,
+    "HighIncome":       40,
+    "MedIncome":        30,
+    "LowNoIncome":      20,
+}
 
-def _score(value, good_fn, ok_fn):
-    """Return 100/50/0 based on threshold functions, or None if value is None."""
-    if value is None:
-        return None
-    if good_fn(value):
-        return 100
-    if ok_fn(value):
-        return 50
+# Kept for non-QScore callers (Sell Board)
+ELIGIBLE_CLASSES = QSCORE_V2_ELIGIBLE_CLASSES
+
+
+def _score_divgrowth_v2(v):
+    """DivGrowth_5Y banding: ≥10%=100, 5–10%=80, 2–5%=60, 0–2%=40, <0%=0."""
+    if v >= 10.0:  return 100
+    if v >= 5.0:   return 80
+    if v >= 2.0:   return 60
+    if v >= 0.0:   return 40
     return 0
 
 
-def _sub_score(scores):
-    """
-    Average a list of scores, ignoring None.
-    If ≥2 blanks in a 2-input sub-component, or all blank, return None.
-    Spec: ≤1 blank → score remaining; 2+ blanks → sub-component blank.
-    """
-    valid = [s for s in scores if s is not None]
-    if not valid:
-        return None
-    blanks = len(scores) - len(valid)
-    if blanks >= 2:
-        return None
-    return round(sum(valid) / len(valid), 2)
+def _score_payout_v2(v):
+    """PayoutRatio banding: ≤0.40=100, 0.40–0.60=80, 0.60–0.75=60, 0.75–0.90=40, >0.90=0."""
+    if v <= 0.40:  return 100
+    if v <= 0.60:  return 80
+    if v <= 0.75:  return 60
+    if v <= 0.90:  return 40
+    return 0
+
+
+def _score_beta_v2(v):
+    """Beta banding: 0.50–0.75=100, 0.75–1.00=80, 1.00–1.25=60, 0.25–0.50=40, <0.25 or >1.25=0."""
+    if 0.50 <= v <= 0.75:  return 100
+    if 0.75 <  v <= 1.00:  return 80
+    if 1.00 <  v <= 1.25:  return 60
+    if 0.25 <= v <  0.50:  return 40
+    return 0
 
 
 def compute_qscore(row, cm):
-    """Compute D_QScore_* sub-components + D_QScore + D_QTier for one row."""
-    cls   = row[cm["M_Div_Coupon_Class"]]
-    elim  = row[cm["M_Eliminated"]]
-    asset = row[cm["M_Asset_Class"]]
-    dyld  = row[cm["S_Dividend_Yield"]]
+    """
+    QScore v2: 4 inputs equal weight, averaged.
+    Any blank input → D_QTier = 'Insufficient Data', D_QScore = blank.
+    Retired sub-components written as blank (headers kept).
+    Sprint 3 replacement for v1 weighted model.
+    """
+    cls   = row[cm["M_Div_Coupon_Class"]] if "M_Div_Coupon_Class" in cm else None
+    elim  = row[cm["M_Eliminated"]]       if "M_Eliminated"       in cm else None
+    asset = row[cm["M_Asset_Class"]]      if "M_Asset_Class"      in cm else None
 
-    blank = {k: "" for k in ["D_QScore_DivSafety", "D_QScore_Debt",
-                               "D_QScore_Profitability", "D_QScore_Stability",
-                               "D_QScore", "D_QTier"]}
+    retired_blank = {
+        "D_QScore_DivSafety":     "",
+        "D_QScore_Debt":          "",
+        "D_QScore_Profitability": "",
+        "D_QScore_Stability":     "",
+    }
+
+    insufficient = dict(retired_blank, D_QScore="", D_QTier="Insufficient Data")
+    ineligible   = dict(retired_blank, D_QScore="", D_QTier="")
 
     # Eligibility gates
     if elim == "No Touch":
-        return blank
+        return ineligible
     if asset != "EQUITIES":
-        return blank
-    if cls not in ELIGIBLE_CLASSES:
-        return blank
-    if not dyld or dyld < 1.0:
-        return blank
+        return ineligible
+    if cls not in QSCORE_V2_ELIGIBLE_CLASSES:
+        return ineligible
 
-    # DivSafety (3 inputs)
-    payout    = row[cm["S_PayoutRatio"]]
-    streak_sc = STREAK_PROXY.get(cls)          # always populated if eligible
-    divgrowth = row[cm["S_DivGrowth_5Y"]]
+    # Input 1: Streak Proxy (from M_Div_Coupon_Class — always populated if eligible)
+    sc_streak = STREAK_PROXY_V2.get(cls)  # None if class somehow missing from map
 
-    sc_payout = _score(payout,
-                       lambda v: v <= 0.75,
-                       lambda v: v <= 0.90) if payout is not None else None
-    sc_divg   = _score(divgrowth,
-                       lambda v: v >= 5.0,
-                       lambda v: v >= 0.0) if divgrowth is not None else None
+    # Input 2: DivGrowth_5Y
+    dg_raw = row[cm["S_DivGrowth_5Y"]] if "S_DivGrowth_5Y" in cm else None
+    sc_divgrowth = _score_divgrowth_v2(float(dg_raw)) if dg_raw is not None else None
 
-    div_safety = _sub_score([sc_payout, streak_sc, sc_divg])
+    # Input 3: PayoutRatio
+    pr_raw = row[cm["S_PayoutRatio"]] if "S_PayoutRatio" in cm else None
+    sc_payout = _score_payout_v2(float(pr_raw)) if pr_raw is not None else None
 
-    # Debt (1 input)
-    de = row[cm["S_DebtEquity"]]
-    sc_de = _score(de, lambda v: v <= 1.0, lambda v: v <= 2.0) if de is not None else None
-    debt = sc_de  # single input — blank if None
+    # Input 4: Beta
+    beta_raw = row[cm["S_Beta"]] if "S_Beta" in cm else None
+    sc_beta = _score_beta_v2(float(beta_raw)) if beta_raw is not None else None
 
-    # Profitability (2 inputs)
-    roe      = row[cm["S_ROE"]]
-    eps_grow = row[cm["S_EPS_Growth_5Y"]]
-    sc_roe  = _score(roe,      lambda v: v >= 15.0, lambda v: v >= 5.0) if roe      is not None else None
-    sc_eps  = _score(eps_grow, lambda v: v >= 5.0,  lambda v: v >= 0.0) if eps_grow is not None else None
-    profit  = _sub_score([sc_roe, sc_eps])
+    # Any blank input → Insufficient Data
+    inputs = [sc_streak, sc_divgrowth, sc_payout, sc_beta]
+    if any(s is None for s in inputs):
+        return insufficient
 
-    # Stability (2 inputs)
-    beta      = row[cm["S_Beta"]]
-    price     = row[cm["S_Last_Price"]]
-    high_52w  = row[cm["S_52W_High"]]
+    score = round(sum(inputs) / 4, 1)
+    if score >= 80:
+        tier = "A"
+    elif score >= 75:
+        tier = "B"
+    elif score >= 60:
+        tier = "C"
+    else:
+        tier = "Excluded"
 
-    sc_beta = None
-    if beta is not None:
-        if 0.5 <= beta <= 1.0:
-            sc_beta = 100
-        elif 0.0 <= beta < 0.5 or 1.0 < beta <= 1.3:
-            sc_beta = 50
-        else:
-            sc_beta = 0
-
-    sc_p52 = None
-    if price is not None and high_52w and high_52w > 0:
-        ratio = price / high_52w
-        sc_p52 = _score(ratio, lambda v: v >= 0.80, lambda v: v >= 0.60)
-
-    stability = _sub_score([sc_beta, sc_p52])
-
-    # Weighted total
-    components = {"DivSafety": (div_safety, 0.35), "Debt": (debt, 0.25),
-                  "Profitability": (profit, 0.20), "Stability": (stability, 0.20)}
-
-    valid_comps = {k: (v, w) for k, (v, w) in components.items() if v is not None}
-    if not valid_comps:
-        return blank
-
-    # Reweight if any component is blank
-    total_weight = sum(w for _, w in valid_comps.values())
-    score = sum(v * (w / total_weight) for _, (v, w) in valid_comps.items())
-    score = round(score, 1)
-
-    tier = "A" if score >= 80 else "B" if score >= 75 else "C" if score >= 60 else "Excluded"
-
-    return {
-        "D_QScore_DivSafety":    round(div_safety,  1) if div_safety  is not None else "",
-        "D_QScore_Debt":         round(debt,         1) if debt        is not None else "",
-        "D_QScore_Profitability":round(profit,       1) if profit      is not None else "",
-        "D_QScore_Stability":    round(stability,    1) if stability   is not None else "",
-        "D_QScore":              score,
-        "D_QTier":               tier,
-    }
+    return dict(retired_blank, D_QScore=score, D_QTier=tier)
 
 
 # ── DIVIDENDS aggregates ──────────────────────────────────────────────────────
@@ -187,9 +168,12 @@ def compute_qscore(row, cm):
 def build_dividend_aggregates(wb):
     """
     Read DIVIDENDS tab, return per-ticker dicts:
-      annual_income[ticker]  = sum of all Amount rows (annualised proxy = LTM sum)
-      ltm_income[ticker]     = sum of last 12 calendar months
+      all_income[ticker]     = sum of ALL Amount rows, no date filter (inception)
+      annual_income[ticker]  = rolling 12 months from today (D_AnnualIncome)
+      ltm_income[ticker]     = same as annual_income (alias kept for clarity)
       ytd_income[ticker]     = sum of current calendar year
+    Sprint 3: added all_income (D_All_Income); D_AnnualIncome is now rolling
+    12m (was previously all-time sum — renamed to all_income).
     """
     ws = wb["DIVIDENDS"]
     headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
@@ -202,9 +186,9 @@ def build_dividend_aggregates(wb):
     ltm_from = today - relativedelta(months=12)
     ytd_from = date(today.year, 1, 1)
 
-    annual = {}
-    ltm    = {}
-    ytd    = {}
+    all_time = {}  # D_All_Income: inception to date, no filter
+    ltm      = {}  # D_AnnualIncome: rolling 12m
+    ytd      = {}  # D_Income_YTD_GBP
 
     for row in ws.iter_rows(min_row=2, values_only=True):
         ticker = row[ticker_idx]
@@ -223,7 +207,7 @@ def build_dividend_aggregates(wb):
             continue
 
         amount = float(amount)
-        annual[ticker] = annual.get(ticker, 0) + amount
+        all_time[ticker] = all_time.get(ticker, 0) + amount
 
         if dt >= ltm_from:
             ltm[ticker] = ltm.get(ticker, 0) + amount
@@ -231,7 +215,7 @@ def build_dividend_aggregates(wb):
         if dt >= ytd_from:
             ytd[ticker] = ytd.get(ticker, 0) + amount
 
-    return annual, ltm, ytd
+    return all_time, ltm, ytd
 
 
 # ── Sell Board helpers ────────────────────────────────────────────────────────
@@ -303,7 +287,7 @@ def run():
 
     # ── Step 1: DIVIDENDS aggregates ─────────────────────────────────────────
     log.info("Step 1: DIVIDENDS aggregates")
-    annual_map, ltm_map, ytd_map = build_dividend_aggregates(wb)
+    all_time_map, ltm_map, ytd_map = build_dividend_aggregates(wb)
 
     # ── Load all Universe rows into memory ────────────────────────────────────
     all_rows = list(ws_uni.iter_rows(min_row=2, values_only=True))
@@ -313,26 +297,65 @@ def run():
     computed = [{} for _ in all_rows]
 
     # ── Step 1 write + capture for downstream ────────────────────────────────
-    annual_income_by_row = {}
+    # Sprint 3: D_AnnualIncome is now rolling 12m; D_All_Income is all-time.
+    # D_Income_Payback_Pct = D_All_Income / S_CostBasis (cumulative payback).
+    # D_YoC = D_AnnualIncome / S_CostBasis (blended YoC on current holding).
+    annual_income_by_row = {}  # row_idx → rolling-12m income (for downstream YoC/Comptroller)
     total_portfolio_value = 0.0
     for i, row in enumerate(all_rows):
         ticker = row[cm["M_Ticker"]]
         if not ticker:
             continue
-        ann = annual_map.get(ticker, 0)
-        ltm = ltm_map.get(ticker, 0)
-        ytd = ytd_map.get(ticker, 0)
+        all_income = all_time_map.get(ticker, 0)
+        ann_income = ltm_map.get(ticker, 0)   # rolling 12m = D_AnnualIncome
+        ytd        = ytd_map.get(ticker, 0)
 
-        computed[i]["D_AnnualIncome"]    = ann if ann else ""
-        computed[i]["D_Income_LTM_GBP"] = ltm if ltm else ""
-        computed[i]["D_Income_YTD_GBP"] = ytd if ytd else ""
-        annual_income_by_row[i] = ann
+        computed[i]["D_All_Income"]      = all_income if all_income else ""
+        computed[i]["D_AnnualIncome"]    = ann_income if ann_income else ""
+        computed[i]["D_Income_LTM_GBP"]  = ann_income if ann_income else ""  # alias
+        computed[i]["D_Income_YTD_GBP"]  = ytd if ytd else ""
+        annual_income_by_row[i]          = ann_income
 
-        mkt_val = row[cm["S_MarketValue_GBP"]]
+        # D_Income_Payback_Pct = D_All_Income / S_CostBasis
+        cost_basis = row[cm["S_CostBasis"]] if "S_CostBasis" in cm else None
+        if all_income and cost_basis:
+            try:
+                computed[i]["D_Income_Payback_Pct"] = round(all_income / float(cost_basis), 4)
+            except (TypeError, ValueError, ZeroDivisionError):
+                computed[i]["D_Income_Payback_Pct"] = ""
+        else:
+            computed[i]["D_Income_Payback_Pct"] = ""
+
+        # D_YOC is left unchanged (yfinance yield — written in Step 5, not here).
+
+        mkt_val = row[cm["S_MarketValue_GBP"]] if "S_MarketValue_GBP" in cm else None
         if mkt_val:
             total_portfolio_value += float(mkt_val)
 
     log.info(f"Total portfolio value for sleeve weighting: £{total_portfolio_value:,.2f}")
+
+    # ── QScore trajectory: shift D_QScore → S_QScore_Prior before computing new QScore ──
+    # Sprint 3: S_QScore_Prior replaces M_QScore_Prior in the column header.
+    # We read the current D_QScore (from last run, stored in the workbook)
+    # and write it to S_QScore_Prior before overwriting D_QScore below.
+    log.info("Step 1b: QScore trajectory shift (D_QScore → S_QScore_Prior)")
+    prior_col = "S_QScore_Prior"
+    current_d_col = "D_QScore"
+    if prior_col in cm and current_d_col in cm:
+        for i, row in enumerate(all_rows):
+            current_qscore = row[cm[current_d_col]]
+            if current_qscore is not None and current_qscore != "":
+                computed[i][prior_col] = current_qscore
+            # If blank/None, leave S_QScore_Prior as-is (don't overwrite with blank)
+    elif "M_QScore_Prior" in cm and current_d_col in cm:
+        # Fallback: workbook header not yet renamed — write to M_QScore_Prior column
+        log.warning("S_QScore_Prior not found in Universe headers; falling back to M_QScore_Prior")
+        for i, row in enumerate(all_rows):
+            current_qscore = row[cm[current_d_col]]
+            if current_qscore is not None and current_qscore != "":
+                computed[i]["M_QScore_Prior"] = current_qscore
+    else:
+        log.warning("Neither S_QScore_Prior nor M_QScore_Prior found — trajectory shift skipped.")
 
     # ── Step 2: QScore ────────────────────────────────────────────────────────
     log.info("Step 2: QScore")
@@ -392,14 +415,14 @@ def run():
             computed[i].update({k: "" for k in ["D_YOC","D_YoC_PerHolding","D_GBP_Per_GBP1_Div"]})
             continue
 
-        avg_cost  = row[cm["S_AvgCost"]]
-        cost_bas  = row[cm["S_CostBasis"]]
-        yld       = row[cm["S_Dividend_Yield"]]
+        avg_cost  = row[cm["S_AvgCost"]]   if "S_AvgCost"   in cm else None
+        cost_bas  = row[cm["S_CostBasis"]] if "S_CostBasis" in cm else None
+        yld       = row[cm["S_Dividend_Yield"]] if "S_Dividend_Yield" in cm else None
         ann_inc   = annual_income_by_row.get(i, 0)
 
-        yoc          = round(yld, 4) if yld is not None else ""  # yfinance yield = annual %
-        yoc_holding  = round(ann_inc / float(cost_bas), 4) if (ann_inc and cost_bas) else ""
-        gbp_eff      = round(float(cost_bas) / ann_inc, 2) if (ann_inc and cost_bas and ann_inc > 0) else ""
+        yoc         = round(yld, 4) if yld is not None else ""  # yfinance yield — unchanged
+        yoc_holding = round(ann_inc / float(cost_bas), 4) if (ann_inc and cost_bas) else ""
+        gbp_eff     = round(float(cost_bas) / ann_inc, 2) if (ann_inc and cost_bas and ann_inc > 0) else ""
 
         computed[i].update({
             "D_YOC":              yoc,

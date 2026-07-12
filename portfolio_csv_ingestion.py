@@ -152,26 +152,32 @@ def _is_bc_footer_row(symbol):
 # account-summary.csv headers (confirmed against the actual file, which
 # differ from the prior draft names). "Stock", "Day gain/loss (£)" and
 # "Day gain/loss (%)" are intentionally left unmapped/ignored.
+# Sprint 3 Fix 1: column_map dest values now use the PORTFOLIO tab's actual
+# column names (identical to the CSV source names). Previous S_-prefixed
+# dest names ("S_MarketValue_GBP" etc.) don't exist in the PORTFOLIO tab
+# and caused all updates to silently no-op.
 HL_MATCH_FILES = {
     "account-summary.csv": {
         "sheet": "PORTFOLIO",
         "source_key": "Code",
         "dest_key": "Code",
         "column_map": {
-            "Price (pence)": "S_Current_Price",
-            "Value (£)": "S_MarketValue_GBP",
-            "Cost (£)": "S_CostBasis",
-            "Gain/loss (£)": "S_PnL_GBP",
-            "Gain/loss (%)": "S_PnL_Pct",
-            "Units held": "S_UnitsHeld",
+            "Price (pence)": "Price (pence)",
+            "Value (£)":     "Value (£)",
+            "Cost (£)":      "Cost (£)",
+            "Gain/loss (£)": "Gain/loss (£)",
+            "Gain/loss (%)": "Gain/loss (%)",
+            "Units held":    "Units held",
         },
     },
 }
 
-# Sprint 2 Run 4 fix #3: "Price (pence)" is pence, S_Current_Price is pounds
-# -- divide by 100 after the normal comma-strip/float clean.
+# Sprint 2 Run 4 fix #3: "Price (pence)" is pence, PORTFOLIO tab stores
+# it as-is (pence) -- no divide-by-100 here. Pounds conversion happens
+# when writing to Universe S_Current_Price (see portfolio_to_universe_s_cols).
+# Sprint 3 Fix 1: transform key updated to match new passthrough dest name.
 HL_COLUMN_TRANSFORMS = {
-    "S_Current_Price": lambda v: (v / 100) if isinstance(v, (int, float)) else v,
+    "Price (pence)": lambda v: v,  # stored as pence in PORTFOLIO; no transform
 }
 
 # HL files: appended as new rows (trade history / dividend payments) - no
@@ -298,13 +304,22 @@ FIELD_TYPES = {
     "S_BC_DivAnnual": "number",
     "S_BC_DivYield": "percent",
     "S_BC_EarningsDate": "date",
-    # HL account-summary.csv
+    # HL account-summary.csv -> PORTFOLIO tab (column names are identical)
+    # Sprint 3 Fix 1: keys updated to match passthrough dest names.
+    "Value (£)":     "number",
+    "Cost (£)":      "number",
+    "Units held":    "number",
+    "Gain/loss (£)": "number",
+    "Gain/loss (%)": "percent",
+    "Price (pence)": "number",
+    # Universe S_ columns (written by portfolio_to_universe_s_cols, not column_map)
     "S_MarketValue_GBP": "number",
     "S_CostBasis": "number",
     "S_UnitsHeld": "number",
     "S_PnL_GBP": "number",
     "S_PnL_Pct": "percent",
     "S_Current_Price": "number",
+    "S_AvgCost": "number",
 }
 
 _FIELD_TYPE_FORMATS = {
@@ -398,22 +413,128 @@ def process_hl_match_file(wb, filename, cfg):
     dest_key_col = headers[cfg["dest_key"]]
     rows_by_key = key_row_map(ws, dest_key_col)
 
+    updated = 0
+    inserted = 0
     for row in rows:
         ticker = row.get(cfg["source_key"])
-        if not ticker or ticker not in rows_by_key:
+        if not ticker:
             continue
-        row_idx = rows_by_key[ticker]
-        for src_col, dest_col in cfg["column_map"].items():
-            if dest_col in headers and src_col in row:
-                field_type = FIELD_TYPES.get(dest_col, "text")
-                value = clean_field_value(row[src_col], field_type)
-                transform = HL_COLUMN_TRANSFORMS.get(dest_col)
-                if transform is not None:
-                    value = transform(value)
-                write_cell(
-                    ws, row_idx, headers[dest_col], value,
-                    number_format=_FIELD_TYPE_FORMATS.get(field_type),
-                )
+        if ticker in rows_by_key:
+            # Update existing row
+            row_idx = rows_by_key[ticker]
+            for src_col, dest_col in cfg["column_map"].items():
+                if dest_col in headers and src_col in row:
+                    field_type = FIELD_TYPES.get(dest_col, "text")
+                    value = clean_field_value(row[src_col], field_type)
+                    transform = HL_COLUMN_TRANSFORMS.get(dest_col)
+                    if transform is not None:
+                        value = transform(value)
+                    write_cell(
+                        ws, row_idx, headers[dest_col], value,
+                        number_format=_FIELD_TYPE_FORMATS.get(field_type),
+                    )
+            updated += 1
+        else:
+            # Sprint 3 Fix 2: insert new position — no silent skip.
+            new_row = ws.max_row + 1
+            for src_col, dest_col in cfg["column_map"].items():
+                if dest_col in headers and src_col in row:
+                    field_type = FIELD_TYPES.get(dest_col, "text")
+                    value = clean_field_value(row[src_col], field_type)
+                    transform = HL_COLUMN_TRANSFORMS.get(dest_col)
+                    if transform is not None:
+                        value = transform(value)
+                    write_cell(
+                        ws, new_row, headers[dest_col], value,
+                        number_format=_FIELD_TYPE_FORMATS.get(field_type),
+                    )
+            # Also write the key column itself
+            if cfg["dest_key"] in headers:
+                write_cell(ws, new_row, headers[cfg["dest_key"]], ticker)
+            rows_by_key[ticker] = new_row
+            inserted += 1
+    print(f"  {cfg['sheet']} via {filename}: {updated} updated, {inserted} inserted.")
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3 Fix 3: PORTFOLIO → Universe S_ column write
+# ---------------------------------------------------------------------------
+
+# Mapping: Universe S_ column -> PORTFOLIO source column.
+# S_AvgCost is derived (Cost / Units), not a direct copy.
+PORTFOLIO_TO_UNIVERSE_MAP = {
+    "S_UnitsHeld":        "Units held",
+    "S_CostBasis":        "Cost (£)",
+    "S_MarketValue_GBP":  "Value (£)",
+    "S_PnL_GBP":          "Gain/loss (£)",
+    "S_PnL_Pct":          "Gain/loss (%)",
+}
+
+
+def portfolio_to_universe_s_cols(wb):
+    """
+    After PORTFOLIO tab is updated from CSV, push the 6 S_ holding columns
+    into Universe, matched by ticker (PORTFOLIO.Code -> Universe.M_Ticker).
+    S_AvgCost is computed as Cost (£) / Units held.
+    Sprint 3 Fix 3.
+    """
+    port_ws = wb["PORTFOLIO"]
+    uni_ws  = wb["Universe"]
+
+    port_headers = header_map(port_ws)
+    uni_headers  = header_map(uni_ws)
+
+    code_col = port_headers.get("Code")
+    if not code_col:
+        print("  [SKIP] PORTFOLIO→Universe: 'Code' column not found in PORTFOLIO tab.")
+        return
+
+    # Build Universe ticker→row map (M_Ticker)
+    uni_ticker_col = uni_headers.get("M_Ticker")
+    if not uni_ticker_col:
+        print("  [SKIP] PORTFOLIO→Universe: 'M_Ticker' column not found in Universe tab.")
+        return
+    uni_row_map = key_row_map(uni_ws, uni_ticker_col)
+
+    written = 0
+    for port_row in range(2, port_ws.max_row + 1):
+        ticker = port_ws.cell(row=port_row, column=code_col).value
+        if not ticker or str(ticker).strip() == "":
+            continue
+        ticker = str(ticker).strip()
+        if ticker not in uni_row_map:
+            continue
+        uni_row = uni_row_map[ticker]
+
+        for s_col, port_col in PORTFOLIO_TO_UNIVERSE_MAP.items():
+            src_col_idx = port_headers.get(port_col)
+            dest_col_idx = uni_headers.get(s_col)
+            if not src_col_idx or not dest_col_idx:
+                continue
+            raw = port_ws.cell(row=port_row, column=src_col_idx).value
+            field_type = FIELD_TYPES.get(s_col, "text")
+            value = clean_field_value(str(raw) if raw is not None else None, field_type)
+            write_cell(uni_ws, uni_row, dest_col_idx, value,
+                       number_format=_FIELD_TYPE_FORMATS.get(field_type))
+            written += 1
+
+        # S_AvgCost = Cost (£) / Units held
+        cost_idx  = port_headers.get("Cost (£)")
+        units_idx = port_headers.get("Units held")
+        avg_col   = uni_headers.get("S_AvgCost")
+        if cost_idx and units_idx and avg_col:
+            cost  = port_ws.cell(row=port_row, column=cost_idx).value
+            units = port_ws.cell(row=port_row, column=units_idx).value
+            try:
+                avg = round(float(cost) / float(units), 6) if (cost and units and float(units) != 0) else None
+            except (TypeError, ValueError):
+                avg = None
+            write_cell(uni_ws, uni_row, avg_col, avg,
+                       number_format=_FIELD_TYPE_FORMATS.get("number"))
+            if avg is not None:
+                written += 1
+
+    print(f"  PORTFOLIO→Universe S_ columns: {written} cell(s) written.")
 
 
 # ---------------------------------------------------------------------------
@@ -547,25 +668,55 @@ def process_hl_append_file(wb, filename, sheet_name):
 
 # ---------------------------------------------------------------------------
 # Ticker enrichment (Sprint 2 Run 5 fixes #2/#3) + DIVIDENDS Month (fix #4)
+# Sprint 3 Fix 5: open position set used to scope enrichment and gap logging
 # ---------------------------------------------------------------------------
 
+def open_position_tickers(wb):
+    """
+    Return the set of ticker codes present in the PORTFOLIO tab (= open
+    positions). Enrichment and gap logging are restricted to these tickers;
+    rows whose Description resolves to a ticker NOT in this set are
+    closed/historical and are skipped silently.
+    """
+    ws = wb["PORTFOLIO"]
+    headers = header_map(ws)
+    code_col = headers.get("Code")
+    if not code_col:
+        return set()
+    tickers = set()
+    for row_idx in range(2, ws.max_row + 1):
+        val = ws.cell(row=row_idx, column=code_col).value
+        if val:
+            tickers.add(str(val).strip().upper())
+    return tickers
+
+
 LOOKUPS_SHEET = "Lookups"
-LOOKUPS_TICKER_COL = 12   # column L
-LOOKUPS_DESCRIPTION_COL = 13  # column M
+# Sprint 3 Fix 4: column positions resolved by header name, not hardcoded
+# numbers. Hardcoded LOOKUPS_TICKER_COL=12/LOOKUPS_DESCRIPTION_COL=13 was
+# the root cause of "0 matched, 71 gap(s)" — ticker enrichment never worked.
 
 
 def build_lookup_pairs(wb):
     """
-    [(ticker, description), ...] from the Lookups tab's L/M columns, sorted
-    by description length descending so the longest (most specific) match
-    wins when checking "does this row's Description start with this
-    Lookups Description" against multiple candidates.
+    [(ticker, description), ...] from the Lookups tab's "Ticker" / "Description"
+    columns (resolved by header name, not position), sorted by description length
+    descending so the longest (most specific) match wins.
+    Sprint 3 Fix 4: replaced hardcoded column numbers with header_map lookup.
     """
     ws = wb[LOOKUPS_SHEET]
+    hmap = header_map(ws)
+    ticker_col = hmap.get("Ticker")
+    desc_col = hmap.get("Description")
+    if not ticker_col or not desc_col:
+        raise KeyError(
+            f"Lookups tab missing 'Ticker' or 'Description' header "
+            f"(found: {list(hmap.keys())})"
+        )
     pairs = []
     for row_idx in range(2, ws.max_row + 1):
-        ticker = ws.cell(row=row_idx, column=LOOKUPS_TICKER_COL).value
-        description = ws.cell(row=row_idx, column=LOOKUPS_DESCRIPTION_COL).value
+        ticker = ws.cell(row=row_idx, column=ticker_col).value
+        description = ws.cell(row=row_idx, column=desc_col).value
         if ticker and description:
             pairs.append((str(ticker), str(description)))
     pairs.sort(key=lambda p: -len(p[1]))
@@ -606,13 +757,19 @@ def _month_str(date_val):
     return None
 
 
-def enrich_dividends(wb, lookup_pairs, run_date):
+def enrich_dividends(wb, lookup_pairs, run_date, open_tickers=None):
     """
     Sweeps every DIVIDENDS row: blank Ticker cells are matched against
     Lookups via Description (gap-logged if no match); blank Month cells are
     derived from Date. Returns (matched, gapped, month_filled) counts plus
     the list of gap dicts (caller logs them to Scheduler alongside Barchart
     gaps).
+    Sprint 3 Fix 5: open_tickers = set of tickers in PORTFOLIO tab (open
+    positions). A row whose existing Ticker (or a resolved match) is NOT in
+    open_tickers is closed/historical — skip silently, no gap logged.
+    Rows with a blank ticker that fail to match at all are gap-logged only
+    if open_tickers is None (no scoping) — we can't determine open/closed
+    status without a ticker, so we err on the side of logging.
     """
     ws = wb["DIVIDENDS"]
     headers = header_map(ws)
@@ -627,12 +784,21 @@ def enrich_dividends(wb, lookup_pairs, run_date):
 
         if ticker_c:
             existing_ticker = ws.cell(row=row_idx, column=ticker_c).value
-            if existing_ticker is None or str(existing_ticker).strip() == "":
+            if existing_ticker is not None and str(existing_ticker).strip() != "":
+                # Row already has a ticker — Fix 5: skip if closed position
+                if open_tickers is not None and str(existing_ticker).strip().upper() not in open_tickers:
+                    pass  # closed/historical — skip month fill too (continue below)
+                # else: open position, already has ticker — nothing to do for enrichment
+            else:
                 found = match_ticker_by_description(description, lookup_pairs)
                 if found:
-                    write_cell(ws, row_idx, ticker_c, found)
-                    matched += 1
+                    # Fix 5: only write+count if open position (or no scoping)
+                    if open_tickers is None or found.upper() in open_tickers:
+                        write_cell(ws, row_idx, ticker_c, found)
+                        matched += 1
+                    # else: closed position match — skip silently, no gap
                 elif description:
+                    # No match found — gap-log (can't determine open/closed without ticker)
                     gapped += 1
                     gaps.append(description)
 
@@ -658,13 +824,17 @@ def enrich_dividends(wb, lookup_pairs, run_date):
     return matched, gapped, month_filled, gap_records
 
 
-def enrich_portfolio_transactions(wb, lookup_pairs, run_date):
+def enrich_portfolio_transactions(wb, lookup_pairs, run_date, open_tickers=None):
     """
     Sweeps every PORTFOLIO_TRANSACTIONS row with a blank Ticker. Only rows
     the Reference field resolves to BUY/SELL are candidates for matching --
     non-trade cash movements (fees, transfers, interest, regular-savings
     references) legitimately have no ticker and are left blank without
     being logged as a gap. Returns (matched, gapped) counts plus gap dicts.
+    Sprint 3 Fix 5: open_tickers = set of tickers in PORTFOLIO tab. Matched
+    tickers not in open_tickers are closed/historical — written but not
+    gap-logged; unmatched BUY/SELL rows are still gap-logged (can't confirm
+    closed without a resolved ticker).
     """
     ws = wb["PORTFOLIO_TRANSACTIONS"]
     headers = header_map(ws)
@@ -687,8 +857,11 @@ def enrich_portfolio_transactions(wb, lookup_pairs, run_date):
         description = ws.cell(row=row_idx, column=desc_c).value if desc_c else None
         found = match_ticker_by_description(description, lookup_pairs)
         if found:
+            # Fix 5: write regardless of open/closed; only gap-log if open
             write_cell(ws, row_idx, ticker_c, found)
             matched += 1
+            if open_tickers is not None and found.upper() not in open_tickers:
+                pass  # closed position — no gap log
         elif description:
             gapped += 1
             gaps.append(description)
@@ -882,7 +1055,14 @@ def run(workbook_path=None):
     gap_due_days = int(legend_scalars["GAP_DUE_DAYS"])
     sector_etf = read_legend_lookup_table(wb, "SECTOR ETF LOOKUP")
 
-    # --- HL inputs: process any present, skip any absent, independently ---
+    # --- Sprint 3: processing order ---
+    # 1. CSV → PORTFOLIO (update existing + insert new)
+    # 2. PORTFOLIO → Universe S_ columns
+    # 3. Ticker enrichment sweeps (DIVIDENDS + PORTFOLIO_TRANSACTIONS via Lookups)
+    # 4. Barchart processing
+    # 5. Gap logging to Scheduler
+
+    # --- Step 1: HL match files (account-summary.csv → PORTFOLIO) ---
     for filename, cfg in HL_MATCH_FILES.items():
         path = INPUTS_HL / filename
         if path.exists():
@@ -892,6 +1072,7 @@ def run(workbook_path=None):
             except Exception as exc:
                 print(f"[SKIP] {filename}: {exc}")
 
+    # --- Step 1b: HL append files (trade history, dividends) ---
     for filename, sheet_name in HL_APPEND_FILES.items():
         path = INPUTS_HL / filename
         if path.exists():
@@ -902,13 +1083,20 @@ def run(workbook_path=None):
             except Exception as exc:
                 print(f"[SKIP] {filename}: {exc}")
 
-    # --- Sprint 2 Run 5 fixes #2/#3/#4: Ticker enrichment + Month ---
+    # --- Step 2: PORTFOLIO → Universe S_ columns (Sprint 3 Fix 3) ---
+    try:
+        portfolio_to_universe_s_cols(wb)
+    except Exception as exc:
+        print(f"[SKIP] PORTFOLIO→Universe S_ write: {exc}")
+
+    # --- Step 3: Ticker enrichment + Month (Sprint 3 Fix 5: open-position scoping) ---
+    open_tickers = open_position_tickers(wb)
     lookup_pairs = build_lookup_pairs(wb)
     div_matched, div_gapped, month_filled, div_gap_records = enrich_dividends(
-        wb, lookup_pairs, run_date
+        wb, lookup_pairs, run_date, open_tickers=open_tickers
     )
     pt_matched, pt_gapped, pt_gap_records = enrich_portfolio_transactions(
-        wb, lookup_pairs, run_date
+        wb, lookup_pairs, run_date, open_tickers=open_tickers
     )
     print(
         f"  DIVIDENDS ticker enrichment: {div_matched} matched, {div_gapped} gap(s) "
@@ -919,7 +1107,7 @@ def run(workbook_path=None):
         f"{pt_gapped} gap(s) logged."
     )
 
-    # --- Barchart inputs: process any present, track presence for gaps ---
+    # --- Step 4: Barchart inputs: process any present, track presence for gaps ---
     universe_ws = wb["Universe"]
     ticker_row_map = universe_ticker_row_map(universe_ws)
     expected_tickers = expected_watchlist_tickers(universe_ws)
