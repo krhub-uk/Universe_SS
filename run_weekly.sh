@@ -62,20 +62,31 @@ else
 fi
 
 # 7. venv activation + python execution
+# Wave 6: EOD must run and complete before weekly starts (sequencing per spec V5.5).
 source "$BASE_DIR/venv/bin/activate"
-python3 "$BASE_DIR/fetch_engine_weekly.py" >> "$LOG_FILE" 2>&1
+
+# Step 7a: EOD price action (updates S_52W_High/Low, change-%, anchors)
+python3 "$BASE_DIR/price_action_eod.py" >> "$LOG_FILE" 2>&1
 SCRIPT_EXIT=$?
 
+# Step 7b: Weekly fundamentals fetch (runs after EOD is complete)
+if [ $SCRIPT_EXIT -eq 0 ]; then
+    python3 "$BASE_DIR/fetch_engine_weekly.py" >> "$LOG_FILE" 2>&1
+    SCRIPT_EXIT=$?
+fi
+
+# Step 7c: Derive engine (computes D_ columns from updated S_ values)
 if [ $SCRIPT_EXIT -eq 0 ]; then
     python3 "$BASE_DIR/derive_engine.py" >> "$LOG_FILE" 2>&1
     SCRIPT_EXIT=$?
 fi
 
+# Step 7d: Coverage script (SECTOR + PORTFOLIO COVERAGE blocks, Wave 7)
+if [ $SCRIPT_EXIT -eq 0 ]; then
+    python3 "$BASE_DIR/coverage_script.py" >> "$LOG_FILE" 2>&1
+    SCRIPT_EXIT=$?
+fi
 
-
-
-
-SCRIPT_EXIT=$?
 
 # 8. End timestamp + elapsed
 END_TS=$(date '+%Y-%m-%d %H:%M:%S')

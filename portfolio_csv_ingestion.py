@@ -1,13 +1,13 @@
 """
 PORTFOLIO / CSV Ingestion Script
-Spec: 00_Portfolio_Automation_Spec_V3.7.md, Section 10.
+Spec: 00_Portfolio_Automation_Spec_V5.5.md, Section 7e. Sprint 4.
 
 Handles all file-based inputs from Cowork input folders. Checks each of the
 6 defined filenames on every run, processes any present, skips any absent
 independently (no all-or-nothing dependency).
 
     HL inputs      (Inputs/HL/):
-        account-summary.csv     -> PORTFOLIO tab (open positions)
+        account-summary.csv     -> PORTFOLIO tab (clear-and-rewrite, qty>0 only)
         portfolio-summary.csv   -> PORTFOLIO_TRANSACTIONS tab (trade history)
         income-transactions.csv -> DIVIDENDS tab (dividend payments)
 
@@ -17,77 +17,36 @@ independently (no all-or-nothing dependency).
         Fundamental.csv  -> Universe tab, S_BC_* (TTM/fundamentals)
 
 Join keys: Code -> M_Ticker (HL) | M_BC_Ticker, falling back to M_Ticker
-when M_BC_Ticker is blank (Barchart). Barchart CSV source key column is
-"Symbol" (not "Ticker") -- confirmed against the actual exported files.
+when M_BC_Ticker is blank (Barchart).
 
-HL files are HL's own Windows export encoding (cp1252) -- they contain a
-literal £ sign that decodes incorrectly under utf-8-sig. Barchart files are
-plain utf-8-sig.
+Processing order (Sprint 3/4):
+  1. CSV -> PORTFOLIO (clear-and-rewrite, Wave 5)
+  2. PORTFOLIO -> Universe S_ columns
+  3. Ticker enrichment sweeps (contains-match, Wave 5)
+  4. Barchart processing
+  5. Gap logging to Scheduler
 
-On success: archive file with `_YYYYMMDD_HHMMSS` suffix appended to the
-original filename, moved into the matching Archive/<source>/ folder.
+DIVIDENDS dedup key (Wave 5): Date + Type + Description + Amount + Ticker.
+  Ticker enrichment runs before dedup check for incoming rows.
+PORTFOLIO_TRANSACTIONS dedup: date + ticker + transaction type + amount.
 
-HL append dedup: before appending a row to DIVIDENDS or
-PORTFOLIO_TRANSACTIONS, a composite key is checked against rows already in
-the sheet (and against rows appended earlier in the same run). Matches are
-skipped silently -- re-ingesting the same export doesn't double the ledger.
-    DIVIDENDS key:               date + description + amount
-    PORTFOLIO_TRANSACTIONS key:  date + ticker + transaction type + amount
-Neither CSV carries a ticker column, so "ticker" in these keys is whatever
-the sheet's Ticker column holds for that row (blank for a fresh append,
-same as historical rows the script has always left blank) -- this still
-catches the intended case, an identical file being re-run.
-PORTFOLIO_TRANSACTIONS has no explicit "type" column; "transaction type" is
-derived from the Reference field (HL's own B.../S... trade-reference
-prefix resolves to BUY/SELL, non-trade references such as "MANAGE FEE" or
-"Card Web" are used as-is).
+Ticker enrichment (Wave 5): contains-match — Lookups description (needle)
+contained within DIVIDENDS/TRANSACTIONS description (haystack).
 
-Gap detection (Barchart): tickers flagged M_BC_Watchlist = 'Y' in the
-Universe tab are "expected" in each Barchart file.
-    Type A gap = expected file missing entirely for this run.
-    Type B gap = file present, but an expected ticker is absent from it.
-Both are logged as rows in the workbook's Scheduler tab (own header block,
-written once then appended to), with a due date read from the Legend tab's
-GAP_DUE_DAYS (Sprint 2 Run 5 fix #5 -- was hardcoded). No BARCHART_GAPS
-worksheet, no CSV output.
+Wave 4: S_Sector derive from Barchart removed. S_Sector authority is now
+populate_sector_from_lookups() in fetch_engine_weekly.py.
 
-Ticker enrichment (Sprint 2 Run 5 fixes #2/#3): after HL rows are appended,
-DIVIDENDS and PORTFOLIO_TRANSACTIONS are swept for blank Ticker cells. Each
-blank row's Description is matched against the Lookups tab's Ticker/
-Description columns (L/M) -- a row's Description is considered a match for
-a Lookups entry if it starts with that entry's Description text (Lookups
-descriptions are the "clean" security name; DIVIDENDS/PORTFOLIO_TRANSACTIONS
-descriptions carry extra suffix text -- "... Dividend Payment" or
-"... <qty> @ <price>"). The longest-matching Lookups description wins, so a
-more specific entry beats a shorter prefix collision. PORTFOLIO_TRANSACTIONS
-only attempts this for rows the Reference field resolves to BUY/SELL --
-non-trade cash movements (fees, transfers, interest) have no ticker by
-definition and are left blank without being logged as a gap. Rows that
-still don't match anything are logged to the Scheduler tab's action-item
-block (same block as the Barchart gaps) as "<SHEET> ticker gap --
-[description] -- manual Lookups update required."
+Wave 2: Conditional cell write guard universal (via workbook_io.write_cell).
+Wave 8: Structured PHASE/ACTION/TICKER/RUN_ID/UID logging.
 
-Month enrichment (Sprint 2 Run 5 fix #4): DIVIDENDS' Month column is
-derived from each row's Date ("YYYY-MM") and written as a literal value at
-ingestion time for any row where it's still blank (pre-existing rows use an
-Excel TEXT() formula for this and are untouched; only rows the Python side
-would otherwise leave blank are backfilled).
-
-Never touches: M_ columns, COVERAGE, Lookups, D_ columns.
-
-Workbook resolution: the live .xlsm is found by globbing the base path for
-a single .xlsm (abort with a clear message on 0 or 2+ matches). On save,
-the patch digit (third digit) of the "v#_#_#" filename is auto-incremented,
-the workbook is saved under the new name, and the old file is moved to
-Archive/Workbook/ (Sprint 2 Run 5 fix #7 -- was deleted outright, which the
-connected workspace folder could block). This only applies when the
-workbook path is resolved automatically -- callers that pass an explicit
-workbook_path (e.g. the test harness) get a plain save-in-place, so tests
-can reuse one scratch file across calls.
+Never touches: M_ columns, COVERAGE, D_ columns.
 """
 
 import csv
+import logging
 import shutil
+import sys
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -98,15 +57,49 @@ from workbook_io import (
     INPUTS_BC,
     ARCHIVE_HL,
     ARCHIVE_BC,
+    BASE_PATH,
     find_workbook,
     save_workbook_with_increment,
     write_cell,
     read_legend_scalars,
-    read_legend_lookup_table,
     NUMBER_FORMAT_NUMBER,
     NUMBER_FORMAT_PERCENT_SCALED,
     NUMBER_FORMAT_DATE,
 )
+
+# ---------------------------------------------------------------------------
+# Logging (Wave 8)
+# ---------------------------------------------------------------------------
+
+LOG_DIR = BASE_PATH / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "portfolio_csv_ingestion.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("portfolio_csv_ingestion")
+
+_ctx: dict = {}  # run-level context: run_id, uid
+_VOCAB_KEYS = ("PHASE=", "ACTION=", "TICKER=", "RUN_ID=", "UID=")
+
+
+def _log(level: str, phase: str, action: str, ticker: str, message: str) -> None:
+    run_id = _ctx.get("run_id", "")
+    uid    = _ctx.get("uid", "")
+    line   = (
+        f"PHASE={phase} ACTION={action} TICKER={ticker} "
+        f"RUN_ID={run_id} UID={uid} | {message}"
+    )
+    for key in _VOCAB_KEYS:
+        if key not in line:
+            log.warning(f"[VOCAB_FAIL] Missing {key} in log line")
+    getattr(log, level.lower())(line)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -115,241 +108,153 @@ from workbook_io import (
 HL_ENCODING = "cp1252"
 BC_ENCODING = "utf-8-sig"
 
-# Sprint 2 Run 5 fix #5: GAP_DUE_DAYS is no longer hardcoded here -- it's
-# read from the Legend tab's CONFIG THRESHOLDS block at run() start and
-# threaded through as a parameter. No module-level default is kept so a
-# missing Legend key fails the run clearly (workbook_io.read_legend_scalars)
-# instead of silently reverting to an old hardcoded number.
-
-# Fields written to the Scheduler tab's own action-item block.
 ACTION_ITEM_FIELDS = ["gap_type", "source_file", "ticker", "note", "detected_date", "due_date"]
-SCHEDULER_SHEET = "Scheduler"
+SCHEDULER_SHEET   = "Scheduler"
 
-# Barchart "N/L" (not-licensed-for-this-symbol) and "N/A" placeholder
-# tokens, plus the two free-text footer lines Barchart appends to every
-# export ("Downloaded from Barchart.com as of ...", "N/L - Data could not
-# be downloaded for licensing reasons."). Confirmed against the actual
-# Sprint 2 Run 5 Fundamental.csv/Custom.csv/Performance.csv exports.
 NULL_VALUE_TOKENS = {"N/L", "N/A"}
 
 
 def _is_bc_footer_row(symbol):
-    """True for Barchart's trailing free-text footer lines, which land in
-    the Symbol column of a DictReader row because the export has no proper
-    header for them. These never match a real ticker so they're harmless to
-    process, but are filtered out up front to keep found_tickers (gap
-    detection) and any match attempts clean."""
     if symbol is None:
         return False
     s = str(symbol).strip()
     return s.startswith("Downloaded from Barchart") or s.startswith("N/L -")
 
 
-# HL files: matched to PORTFOLIO tab by Code -> Code, column map per §10.
-# Sprint 2 Run 3 fix #3: dest_key is "Code" (not "M_Ticker") -- that's the
-# actual ticker header on the PORTFOLIO tab.
-# Sprint 2 Run 4 fix #3: column_map keys below are the real exported
-# account-summary.csv headers (confirmed against the actual file, which
-# differ from the prior draft names). "Stock", "Day gain/loss (£)" and
-# "Day gain/loss (%)" are intentionally left unmapped/ignored.
-# Sprint 3 Fix 1: column_map dest values now use the PORTFOLIO tab's actual
-# column names (identical to the CSV source names). Previous S_-prefixed
-# dest names ("S_MarketValue_GBP" etc.) don't exist in the PORTFOLIO tab
-# and caused all updates to silently no-op.
-HL_MATCH_FILES = {
-    "account-summary.csv": {
-        "sheet": "PORTFOLIO",
-        "source_key": "Code",
-        "dest_key": "Code",
-        "column_map": {
-            "Stock":         "Stock",
-            "Price (pence)": "Price (pence)",
-            "Value (£)":     "Value (£)",
-            "Cost (£)":      "Cost (£)",
-            "Gain/loss (£)": "Gain/loss (£)",
-            "Gain/loss (%)": "Gain/loss (%)",
-            "Units held":    "Units held",
-        },
+# Sprint 4 Wave 5: PORTFOLIO tab is now clear-and-rewrite.
+# column_map maps CSV source column -> PORTFOLIO tab destination column.
+# "Code" (ticker) is written explicitly as the key column.
+HL_PORTFOLIO_FILE = "account-summary.csv"
+HL_PORTFOLIO_CFG = {
+    "sheet":      "PORTFOLIO",
+    "source_key": "Code",
+    "qty_col":    "Units held",   # filter: quantity > 0
+    "column_map": {
+        "Stock":         "Stock",
+        "Price (pence)": "Price (pence)",
+        "Value (£)":     "Value (£)",
+        "Cost (£)":      "Cost (£)",
+        "Gain/loss (£)": "Gain/loss (£)",
+        "Gain/loss (%)": "Gain/loss (%)",
+        "Units held":    "Units held",
     },
 }
 
-# Sprint 2 Run 4 fix #3: "Price (pence)" is pence, PORTFOLIO tab stores
-# it as-is (pence) -- no divide-by-100 here. Pounds conversion happens
-# when writing to Universe S_Current_Price (see portfolio_to_universe_s_cols).
-# Sprint 3 Fix 1: transform key updated to match new passthrough dest name.
-HL_COLUMN_TRANSFORMS = {
-    "Price (pence)": lambda v: v,  # stored as pence in PORTFOLIO; no transform
-}
-
-# HL files: appended as new rows (trade history / dividend payments) - no
-# column mapping given in §10 beyond destination tab, so rows are copied
-# through matching by header name.
 HL_APPEND_FILES = {
-    "portfolio-summary.csv": "PORTFOLIO_TRANSACTIONS",
+    "portfolio-summary.csv":  "PORTFOLIO_TRANSACTIONS",
     "income-transactions.csv": "DIVIDENDS",
 }
 
-# Barchart files: matched to Universe tab by M_BC_Ticker (fallback M_Ticker),
-# column map per §10. Source key is "Symbol" in all three Barchart exports.
-#
-# Sprint 2 Run 3 fix #1/#2: column maps below use the real exported headers
-# (confirmed against the actual Custom.csv / Performance.csv files, which
-# differ from the original §10 draft names). S_BC_EBITDA is dropped entirely
-# -- there's no EBITDA column in the real Custom.csv export.
-#
-# Sprint 2 Run 5 fix #1: Fundamental.csv column_map below replaces a set of
-# placeholder header names ("PE_TTM", "EPS_TTM", ...) that never matched the
-# real export -- confirmed against the actual Fundamental.csv, whose header
-# row is: Symbol, Name, "Market Cap", "P/E ttm", "EPS ttm", "Net Income(a)",
-# Beta, Dividend(a), "Div Yield(a)", "Earnings Date". Note this differs from
-# the spec draft's assumed "Market Cap, $K" header -- the real column is
-# just "Market Cap" and its values are already full-scale (not in $K).
-# "Market Cap" is listed in fill_if_blank because Custom.csv's own "Market
-# Cap" column feeds the same S_BC_MarketCap destination and is processed
-# first -- Fundamental.csv should only fill the gap if Custom.csv didn't
-# already populate it, never overwrite.
 BC_MATCH_FILES = {
     "Custom.csv": {
-        "sheet": "Universe",
+        "sheet":      "Universe",
         "source_key": "Symbol",
         "column_map": {
-            "Sector": "S_BC_Sector",
-            "Market Cap": "S_BC_MarketCap",
-            "Beta": "S_BC_Beta60M",
-            "Div Yield(a)": "S_BC_DivYieldFwd",
-            "Div Payout%": "S_BC_PayoutRatio",
-            "5Y Div%": "S_BC_DivGrowth5Y",
-            "P/E fwd": "S_BC_PE_Fwd",
-            "ROE%": "S_BC_ROE",
-            "Debt/Equity": "S_BC_DebtEquity",
-            "Int Cov": "S_BC_IntCoverage",
+            "Sector":         "S_BC_Sector",
+            "Market Cap":     "S_BC_MarketCap",
+            "Beta":           "S_BC_Beta60M",
+            "Div Yield(a)":   "S_BC_DivYieldFwd",
+            "Div Payout%":    "S_BC_PayoutRatio",
+            "5Y Div%":        "S_BC_DivGrowth5Y",
+            "P/E fwd":        "S_BC_PE_Fwd",
+            "ROE%":           "S_BC_ROE",
+            "Debt/Equity":    "S_BC_DebtEquity",
+            "Int Cov":        "S_BC_IntCoverage",
             "Analyst Rating": "S_BC_AnalystRating",
-            "5Y Earn%": "S_BC_EarningsGrowth5Y",
-            "Dividend Date": "S_BC_ExDivDate",
-            "PEG": "S_BC_PEG",
+            "5Y Earn%":       "S_BC_EarningsGrowth5Y",
+            "Dividend Date":  "S_BC_ExDivDate",
+            "PEG":            "S_BC_PEG",
         },
     },
     "Performance.csv": {
-        "sheet": "Universe",
+        "sheet":      "Universe",
         "source_key": "Symbol",
         "column_map": {
             "Wtd Alpha": "S_BC_WtdAlpha",
-            "5D %Chg": "S_BC_Pct5D",
-            "1M %Chg": "S_BC_Pct1M",
-            "3M %Chg": "S_BC_Pct3M",
-            "52W %Chg": "S_BC_Pct52W",
-            "YTD %Chg": "S_BC_PctYTD",
+            "5D %Chg":   "S_BC_Pct5D",
+            "1M %Chg":   "S_BC_Pct1M",
+            "3M %Chg":   "S_BC_Pct3M",
+            "52W %Chg":  "S_BC_Pct52W",
+            "YTD %Chg":  "S_BC_PctYTD",
         },
     },
     "Fundamental.csv": {
-        "sheet": "Universe",
+        "sheet":      "Universe",
         "source_key": "Symbol",
         "column_map": {
-            "Market Cap": "S_BC_MarketCap",
-            "P/E ttm": "S_BC_PE_TTM",
-            "EPS ttm": "S_BC_EPS_TTM",
+            "Market Cap":    "S_BC_MarketCap",
+            "P/E ttm":       "S_BC_PE_TTM",
+            "EPS ttm":       "S_BC_EPS_TTM",
             "Net Income(a)": "S_BC_NetIncome",
-            "Beta": "S_BC_Beta",
-            "Dividend(a)": "S_BC_DivAnnual",
-            "Div Yield(a)": "S_BC_DivYield",
+            "Beta":          "S_BC_Beta",
+            "Dividend(a)":   "S_BC_DivAnnual",
+            "Div Yield(a)":  "S_BC_DivYield",
             "Earnings Date": "S_BC_EarningsDate",
         },
         "fill_if_blank": {"S_BC_MarketCap"},
     },
 }
 
-# Sprint 2 Run 5 fix #5: SECTOR_ETF used to be a hardcoded module dict --
-# now read from the Legend tab's "SECTOR ETF LOOKUP" block at run() start
-# and passed through as a parameter (see map_sector / process_bc_match_file).
-
-
-def map_sector(raw_sector, sector_etf):
-    if raw_sector is None:
-        return None
-    return sector_etf.get(raw_sector, "UNMAP")
-
-
-# Sprint 2 Run 3 fix #6: destination-column -> value type, used to (a) clean
-# the raw CSV string (strip commas / "%") and (b) pick the number_format
-# applied via write_cell. Not exhaustive over every S_ column in the
-# workbook -- only the ones these scripts actually write.
+# Sprint 4 Wave 4: column renames (_Pct suffix) applied in FIELD_TYPES.
+# S_Sector removed — no longer derived from Barchart by this script.
 FIELD_TYPES = {
     # BC Custom.csv
-    "S_BC_Sector": "text",
-    "S_Sector": "text",
-    "S_BC_MarketCap": "number",
-    "S_BC_Beta60M": "number",
-    "S_BC_DivYieldFwd": "percent",
-    "S_BC_PayoutRatio": "percent",
-    "S_BC_DivGrowth5Y": "percent",
-    "S_BC_PE_Fwd": "number",
-    "S_BC_ROE": "percent",
-    "S_BC_DebtEquity": "number",
-    "S_BC_IntCoverage": "number",
-    "S_BC_AnalystRating": "number",
+    "S_BC_Sector":           "text",
+    "S_BC_MarketCap":        "number",
+    "S_BC_Beta60M":          "number",
+    "S_BC_DivYieldFwd":      "percent",
+    "S_BC_PayoutRatio":      "percent",
+    "S_BC_DivGrowth5Y":      "percent",
+    "S_BC_PE_Fwd":           "number",
+    "S_BC_ROE":              "percent",
+    "S_BC_DebtEquity":       "number",
+    "S_BC_IntCoverage":      "number",
+    "S_BC_AnalystRating":    "number",
     "S_BC_EarningsGrowth5Y": "percent",
-    "S_BC_ExDivDate": "date",
-    "S_BC_PEG": "number",
+    "S_BC_ExDivDate":        "date",
+    "S_BC_PEG":              "number",
     # BC Performance.csv
     "S_BC_WtdAlpha": "number",
-    "S_BC_Pct5D": "percent",
-    "S_BC_Pct1M": "percent",
-    "S_BC_Pct3M": "percent",
-    "S_BC_Pct52W": "percent",
-    "S_BC_PctYTD": "percent",
+    "S_BC_Pct5D":    "percent",
+    "S_BC_Pct1M":    "percent",
+    "S_BC_Pct3M":    "percent",
+    "S_BC_Pct52W":   "percent",
+    "S_BC_PctYTD":   "percent",
     # BC Fundamental.csv
-    "S_BC_PE_TTM": "number",
-    "S_BC_EPS_TTM": "number",
-    "S_BC_NetIncome": "number",
-    "S_BC_Beta": "number",
-    "S_BC_DivAnnual": "number",
-    "S_BC_DivYield": "percent",
+    "S_BC_PE_TTM":       "number",
+    "S_BC_EPS_TTM":      "number",
+    "S_BC_NetIncome":    "number",
+    "S_BC_Beta":         "number",
+    "S_BC_DivAnnual":    "number",
+    "S_BC_DivYield":     "percent",
     "S_BC_EarningsDate": "date",
-    # HL account-summary.csv -> PORTFOLIO tab (column names are identical)
-    # Sprint 3 Fix 1: keys updated to match passthrough dest names.
+    # HL account-summary.csv -> PORTFOLIO tab (column names identical)
     "Value (£)":     "number",
     "Cost (£)":      "number",
     "Units held":    "number",
     "Gain/loss (£)": "number",
     "Gain/loss (%)": "percent",
     "Price (pence)": "number",
-    # Universe S_ columns (written by portfolio_to_universe_s_cols, not column_map)
+    # Universe S_ columns (written by portfolio_to_universe_s_cols)
     "S_MarketValue_GBP": "number",
-    "S_CostBasis": "number",
-    "S_UnitsHeld": "number",
-    "S_PnL_GBP": "number",
-    "S_PnL_Pct": "percent",
-    "S_Current_Price": "number",
-    "S_AvgCost": "number",
+    "S_CostBasis":       "number",
+    "S_UnitsHeld":       "number",
+    "S_PnL_GBP":         "number",
+    "S_PnL_Pct":         "percent",
+    "S_Current_Price":   "number",
+    "S_AvgCost":         "number",
 }
 
 _FIELD_TYPE_FORMATS = {
-    "number": NUMBER_FORMAT_NUMBER,
+    "number":  NUMBER_FORMAT_NUMBER,
     "percent": NUMBER_FORMAT_PERCENT_SCALED,
-    "date": NUMBER_FORMAT_DATE,
-    "text": None,
+    "date":    NUMBER_FORMAT_DATE,
+    "text":    None,
 }
 
 
 def clean_field_value(raw, field_type):
-    """
-    Clean a raw CSV string per its field_type (see FIELD_TYPES):
-      number  -> strip commas, cast to float
-      percent -> strip commas and "%", cast to float (percentage-scaled,
-                 e.g. "5.09%" -> 5.09, not 0.0509 -- see workbook_io's
-                 NUMBER_FORMAT_PERCENT_SCALED note)
-      date    -> parse "YYYY-MM-DD" into a real date object so the Date
-                 number_format actually applies in Excel
-      text / unmapped -> passed through unchanged
-    Falls back to the raw string if parsing fails, rather than dropping
-    the value or crashing the row.
-
-    Sprint 2 Run 5 fix #1: Barchart's "N/L" (not licensed for this symbol)
-    and "N/A" placeholder tokens are treated as blank (None) regardless of
-    field_type, rather than being parsed as a number (fails, falls back to
-    storing the literal string "N/L"/"N/A" in a numeric column) or stored
-    as literal text.
-    """
+    """Clean raw CSV string per field_type. NULL_VALUE_TOKENS -> None."""
     if raw is None:
         return None
     s = str(raw).strip()
@@ -404,97 +309,93 @@ def read_csv_rows(path, encoding):
 
 
 # ---------------------------------------------------------------------------
-# HL: match-and-update files (account-summary.csv)
+# Wave 5: PORTFOLIO clear-and-rewrite
 # ---------------------------------------------------------------------------
 
-def process_hl_match_file(wb, filename, cfg):
-    rows = read_csv_rows(INPUTS_HL / filename, HL_ENCODING)
-    ws = wb[cfg["sheet"]]
+def process_hl_portfolio_rewrite(wb, filename, cfg):
+    """
+    Sprint 4 Wave 5: clear PORTFOLIO tab (keep row-1 header) then rewrite
+    from CSV. Include only rows where quantity (Units held) > 0.
+    Source faithful — no M_Eliminated check at ingestion.
+    """
+    rows    = read_csv_rows(INPUTS_HL / filename, HL_ENCODING)
+    ws      = wb[cfg["sheet"]]
     headers = header_map(ws)
-    dest_key_col = headers[cfg["dest_key"]]
-    rows_by_key = key_row_map(ws, dest_key_col)
 
-    updated = 0
-    inserted = 0
+    # Clear all data rows, keep header
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    qty_col_src = cfg["qty_col"]
+    src_key     = cfg["source_key"]
+
+    written = 0
+    new_row = 2
     for row in rows:
-        ticker = row.get(cfg["source_key"])
+        qty_raw = row.get(qty_col_src, "")
+        try:
+            qty = float(str(qty_raw).replace(",", "").strip()) if qty_raw else 0.0
+        except ValueError:
+            qty = 0.0
+        if qty <= 0:
+            continue
+
+        ticker = row.get(src_key)
         if not ticker:
             continue
-        if ticker in rows_by_key:
-            # Update existing row
-            row_idx = rows_by_key[ticker]
-            for src_col, dest_col in cfg["column_map"].items():
-                if dest_col in headers and src_col in row:
-                    field_type = FIELD_TYPES.get(dest_col, "text")
-                    value = clean_field_value(row[src_col], field_type)
-                    transform = HL_COLUMN_TRANSFORMS.get(dest_col)
-                    if transform is not None:
-                        value = transform(value)
-                    write_cell(
-                        ws, row_idx, headers[dest_col], value,
-                        number_format=_FIELD_TYPE_FORMATS.get(field_type),
-                    )
-            updated += 1
-        else:
-            # Sprint 3 Fix 2: insert new position — no silent skip.
-            new_row = ws.max_row + 1
-            for src_col, dest_col in cfg["column_map"].items():
-                if dest_col in headers and src_col in row:
-                    field_type = FIELD_TYPES.get(dest_col, "text")
-                    value = clean_field_value(row[src_col], field_type)
-                    transform = HL_COLUMN_TRANSFORMS.get(dest_col)
-                    if transform is not None:
-                        value = transform(value)
-                    write_cell(
-                        ws, new_row, headers[dest_col], value,
-                        number_format=_FIELD_TYPE_FORMATS.get(field_type),
-                    )
-            # Also write the key column itself
-            if cfg["dest_key"] in headers:
-                write_cell(ws, new_row, headers[cfg["dest_key"]], ticker)
-            rows_by_key[ticker] = new_row
-            inserted += 1
-    print(f"  {cfg['sheet']} via {filename}: {updated} updated, {inserted} inserted.")
+
+        # Write Code (key) column
+        if src_key in headers:
+            write_cell(ws, new_row, headers[src_key], str(ticker).strip())
+
+        # Write mapped columns
+        for src_col, dest_col in cfg["column_map"].items():
+            if dest_col in headers and src_col in row:
+                field_type = FIELD_TYPES.get(dest_col, "text")
+                value = clean_field_value(row[src_col], field_type)
+                write_cell(
+                    ws, new_row, headers[dest_col], value,
+                    number_format=_FIELD_TYPE_FORMATS.get(field_type),
+                )
+        new_row += 1
+        written += 1
+
+    _log("info", "INGEST", "PORTFOLIO_REWRITE", "",
+         f"{written} rows written from CSV (qty>0 filter applied)")
 
 
 # ---------------------------------------------------------------------------
-# Sprint 3 Fix 3: PORTFOLIO → Universe S_ column write
+# Sprint 3 Fix 3: PORTFOLIO -> Universe S_ column write
 # ---------------------------------------------------------------------------
 
-# Mapping: Universe S_ column -> PORTFOLIO source column.
-# S_AvgCost is derived (Cost / Units), not a direct copy.
 PORTFOLIO_TO_UNIVERSE_MAP = {
-    "S_UnitsHeld":        "Units held",
-    "S_CostBasis":        "Cost (£)",
-    "S_MarketValue_GBP":  "Value (£)",
-    "S_PnL_GBP":          "Gain/loss (£)",
-    "S_PnL_Pct":          "Gain/loss (%)",
+    "S_UnitsHeld":       "Units held",
+    "S_CostBasis":       "Cost (£)",
+    "S_MarketValue_GBP": "Value (£)",
+    "S_PnL_GBP":         "Gain/loss (£)",
+    "S_PnL_Pct":         "Gain/loss (%)",
 }
 
 
 def portfolio_to_universe_s_cols(wb):
-    """
-    After PORTFOLIO tab is updated from CSV, push the 6 S_ holding columns
-    into Universe, matched by ticker (PORTFOLIO.Code -> Universe.M_Ticker).
-    S_AvgCost is computed as Cost (£) / Units held.
-    Sprint 3 Fix 3.
-    """
-    port_ws = wb["PORTFOLIO"]
-    uni_ws  = wb["Universe"]
-
+    """Push 6 S_ holding columns from PORTFOLIO into Universe. S_AvgCost derived."""
+    port_ws     = wb["PORTFOLIO"]
+    uni_ws      = wb["Universe"]
     port_headers = header_map(port_ws)
     uni_headers  = header_map(uni_ws)
 
     code_col = port_headers.get("Code")
     if not code_col:
-        print("  [SKIP] PORTFOLIO→Universe: 'Code' column not found in PORTFOLIO tab.")
+        _log("warning", "INGEST", "PORT_TO_UNI", "",
+             "Code column not found in PORTFOLIO — skipped")
         return
 
-    # Build Universe ticker→row map (M_Ticker)
     uni_ticker_col = uni_headers.get("M_Ticker")
     if not uni_ticker_col:
-        print("  [SKIP] PORTFOLIO→Universe: 'M_Ticker' column not found in Universe tab.")
+        _log("warning", "INGEST", "PORT_TO_UNI", "",
+             "M_Ticker not found in Universe — skipped")
         return
+
     uni_row_map = key_row_map(uni_ws, uni_ticker_col)
 
     written = 0
@@ -508,7 +409,7 @@ def portfolio_to_universe_s_cols(wb):
         uni_row = uni_row_map[ticker]
 
         for s_col, port_col in PORTFOLIO_TO_UNIVERSE_MAP.items():
-            src_col_idx = port_headers.get(port_col)
+            src_col_idx  = port_headers.get(port_col)
             dest_col_idx = uni_headers.get(s_col)
             if not src_col_idx or not dest_col_idx:
                 continue
@@ -527,7 +428,10 @@ def portfolio_to_universe_s_cols(wb):
             cost  = port_ws.cell(row=port_row, column=cost_idx).value
             units = port_ws.cell(row=port_row, column=units_idx).value
             try:
-                avg = round(float(cost) / float(units), 6) if (cost and units and float(units) != 0) else None
+                avg = (
+                    round(float(cost) / float(units), 6)
+                    if (cost and units and float(units) != 0) else None
+                )
             except (TypeError, ValueError):
                 avg = None
             write_cell(uni_ws, uni_row, avg_col, avg,
@@ -535,11 +439,11 @@ def portfolio_to_universe_s_cols(wb):
             if avg is not None:
                 written += 1
 
-    print(f"  PORTFOLIO→Universe S_ columns: {written} cell(s) written.")
+    _log("info", "INGEST", "PORT_TO_UNI", "", f"{written} cell(s) written to Universe S_ columns")
 
 
 # ---------------------------------------------------------------------------
-# HL: append files (portfolio-summary.csv, income-transactions.csv)
+# HL: append files (DIVIDENDS, PORTFOLIO_TRANSACTIONS)
 # ---------------------------------------------------------------------------
 
 def _normalize_date(value):
@@ -570,12 +474,7 @@ def _normalize_ticker(value):
 
 
 def transaction_type_from_reference(reference):
-    """
-    PORTFOLIO_TRANSACTIONS has no explicit "type" column. HL's Reference
-    field encodes it: B<digits> = buy, S<digits> = sell, anything else
-    (MANAGE FEE, Card Web, REG. SAVER, ...) is a non-trade cash movement
-    and is used as its own type label.
-    """
+    """B<digits>=BUY, S<digits>=SELL, anything else used as-is."""
     ref = str(reference or "").strip()
     if len(ref) > 1 and ref[0].upper() == "B" and ref[1:].isdigit():
         return "BUY"
@@ -584,12 +483,19 @@ def transaction_type_from_reference(reference):
     return ref.upper()
 
 
-def dividend_key(date_val, description_val, amount_val):
-    # Sprint 3: key uses description instead of ticker. Ticker is blank at
-    # append time (enrichment runs after), so ticker-based dedup always missed
-    # and caused duplicates on re-ingestion of the same export.
-    desc = str(description_val or "").strip()
-    return (_normalize_date(date_val), desc, _normalize_amount(amount_val))
+def dividend_key(date_val, type_val, description_val, amount_val, ticker_val=""):
+    """
+    Sprint 4 Wave 5: dedup key = Date + Type + Description + Amount + Ticker.
+    Ticker enrichment runs before dedup check for incoming rows so that
+    incoming can match against already-enriched existing rows.
+    """
+    return (
+        _normalize_date(date_val),
+        str(type_val or "").strip().upper(),
+        str(description_val or "").strip(),
+        _normalize_amount(amount_val),
+        _normalize_ticker(ticker_val),
+    )
 
 
 def transaction_key(date_val, ticker_val, reference_val, amount_val):
@@ -602,32 +508,36 @@ def transaction_key(date_val, ticker_val, reference_val, amount_val):
 
 
 def existing_append_keys(ws, headers, sheet_name):
-    """Composite keys already present in the sheet, per §-defined dedup rule."""
+    """Composite keys already present in the sheet per dedup rule."""
     keys = set()
     if sheet_name == "DIVIDENDS":
-        date_c = headers.get("Date")
-        desc_c = headers.get("Description")
+        date_c   = headers.get("Date")
+        type_c   = headers.get("Type")
+        desc_c   = headers.get("Description")
         amount_c = headers.get("Amount")
+        ticker_c = headers.get("Ticker")
         if not (date_c and amount_c):
             return keys
         for row_idx in range(2, ws.max_row + 1):
-            d = ws.cell(row=row_idx, column=date_c).value
-            desc = ws.cell(row=row_idx, column=desc_c).value if desc_c else None
-            a = ws.cell(row=row_idx, column=amount_c).value
+            d    = ws.cell(row=row_idx, column=date_c).value
+            t    = ws.cell(row=row_idx, column=type_c).value   if type_c   else None
+            desc = ws.cell(row=row_idx, column=desc_c).value   if desc_c   else None
+            a    = ws.cell(row=row_idx, column=amount_c).value
+            tk   = ws.cell(row=row_idx, column=ticker_c).value if ticker_c else None
             if d is None and a is None:
                 continue
-            keys.add(dividend_key(d, desc, a))
+            keys.add(dividend_key(d, t, desc, a, tk or ""))
     elif sheet_name == "PORTFOLIO_TRANSACTIONS":
-        date_c = headers.get("Trade date")
+        date_c   = headers.get("Trade date")
         ticker_c = headers.get("Ticker")
-        ref_c = headers.get("Reference")
+        ref_c    = headers.get("Reference")
         amount_c = headers.get("Value (£)")
         if not (date_c and amount_c):
             return keys
         for row_idx in range(2, ws.max_row + 1):
             d = ws.cell(row=row_idx, column=date_c).value
             t = ws.cell(row=row_idx, column=ticker_c).value if ticker_c else None
-            r = ws.cell(row=row_idx, column=ref_c).value if ref_c else None
+            r = ws.cell(row=row_idx, column=ref_c).value    if ref_c    else None
             a = ws.cell(row=row_idx, column=amount_c).value
             if d is None and a is None:
                 continue
@@ -635,20 +545,33 @@ def existing_append_keys(ws, headers, sheet_name):
     return keys
 
 
-def key_for_incoming_row(sheet_name, row):
-    """row: a CSV DictReader row (raw strings)."""
+def key_for_incoming_row(sheet_name, row, lookup_pairs=None):
+    """
+    Build dedup key for an incoming CSV row.
+    For DIVIDENDS: attempts inline ticker enrichment via lookup_pairs before
+    building the key, so incoming can match already-enriched existing rows.
+    """
     if sheet_name == "DIVIDENDS":
-        return dividend_key(row.get("Date"), row.get("Description"), row.get("Amount"))
+        ticker = ""
+        if lookup_pairs:
+            ticker = match_ticker_by_description(
+                row.get("Description"), lookup_pairs
+            ) or ""
+        return dividend_key(
+            row.get("Date"), row.get("Type"),
+            row.get("Description"), row.get("Amount"), ticker,
+        )
     if sheet_name == "PORTFOLIO_TRANSACTIONS":
         return transaction_key(
-            row.get("Trade date"), row.get("Ticker"), row.get("Reference"), row.get("Value (£)")
+            row.get("Trade date"), row.get("Ticker"),
+            row.get("Reference"), row.get("Value (£)"),
         )
     return None
 
 
-def process_hl_append_file(wb, filename, sheet_name):
-    rows = read_csv_rows(INPUTS_HL / filename, HL_ENCODING)
-    ws = wb[sheet_name]
+def process_hl_append_file(wb, filename, sheet_name, lookup_pairs=None):
+    rows    = read_csv_rows(INPUTS_HL / filename, HL_ENCODING)
+    ws      = wb[sheet_name]
     headers = header_map(ws)
 
     existing_keys = existing_append_keys(ws, headers, sheet_name)
@@ -656,7 +579,7 @@ def process_hl_append_file(wb, filename, sheet_name):
     next_row = ws.max_row + 1
     appended, skipped = 0, 0
     for row in rows:
-        key = key_for_incoming_row(sheet_name, row)
+        key = key_for_incoming_row(sheet_name, row, lookup_pairs)
         if key is not None and key in existing_keys:
             skipped += 1
             continue
@@ -670,23 +593,19 @@ def process_hl_append_file(wb, filename, sheet_name):
         next_row += 1
         appended += 1
 
+    _log("info", "INGEST", f"APPEND_{sheet_name}", "",
+         f"{appended} appended, {skipped} dupes skipped")
     return appended, skipped
 
 
 # ---------------------------------------------------------------------------
-# Ticker enrichment (Sprint 2 Run 5 fixes #2/#3) + DIVIDENDS Month (fix #4)
-# Sprint 3 Fix 5: open position set used to scope enrichment and gap logging
+# Ticker enrichment (contains-match, Sprint 4 Wave 5) + DIVIDENDS Month
 # ---------------------------------------------------------------------------
 
 def open_position_tickers(wb):
-    """
-    Return the set of ticker codes present in the PORTFOLIO tab (= open
-    positions). Enrichment and gap logging are restricted to these tickers;
-    rows whose Description resolves to a ticker NOT in this set are
-    closed/historical and are skipped silently.
-    """
+    """Set of ticker codes in PORTFOLIO tab (open positions only)."""
     ws = wb["PORTFOLIO"]
-    headers = header_map(ws)
+    headers  = header_map(ws)
     code_col = headers.get("Code")
     if not code_col:
         return set()
@@ -699,22 +618,18 @@ def open_position_tickers(wb):
 
 
 LOOKUPS_SHEET = "Lookups"
-# Sprint 3 Fix 4: column positions resolved by header name, not hardcoded
-# numbers. Hardcoded LOOKUPS_TICKER_COL=12/LOOKUPS_DESCRIPTION_COL=13 was
-# the root cause of "0 matched, 71 gap(s)" — ticker enrichment never worked.
 
 
 def build_lookup_pairs(wb):
     """
-    [(ticker, description), ...] from the Lookups tab's "Ticker" / "Description"
-    columns (resolved by header name, not position), sorted by description length
-    descending so the longest (most specific) match wins.
-    Sprint 3 Fix 4: replaced hardcoded column numbers with header_map lookup.
+    [(ticker, description), ...] from Lookups 'Ticker'/'Description' columns,
+    resolved by header name. Sorted longest-first so the most specific match wins.
+    Sprint 3 Fix 4: header-name resolution.
     """
-    ws = wb[LOOKUPS_SHEET]
+    ws   = wb[LOOKUPS_SHEET]
     hmap = header_map(ws)
     ticker_col = hmap.get("Ticker")
-    desc_col = hmap.get("Description")
+    desc_col   = hmap.get("Description")
     if not ticker_col or not desc_col:
         raise KeyError(
             f"Lookups tab missing 'Ticker' or 'Description' header "
@@ -722,7 +637,7 @@ def build_lookup_pairs(wb):
         )
     pairs = []
     for row_idx in range(2, ws.max_row + 1):
-        ticker = ws.cell(row=row_idx, column=ticker_col).value
+        ticker      = ws.cell(row=row_idx, column=ticker_col).value
         description = ws.cell(row=row_idx, column=desc_col).value
         if ticker and description:
             pairs.append((str(ticker), str(description)))
@@ -732,25 +647,21 @@ def build_lookup_pairs(wb):
 
 def match_ticker_by_description(description, lookup_pairs):
     """
-    Lookups' Description column holds the "clean" security name; DIVIDENDS/
-    PORTFOLIO_TRANSACTIONS descriptions carry extra suffix text ("... 20 @
-    5377.8393", "... Overseas Dividend Payment"). A row matches a Lookups
-    entry if its Description starts with that entry's Description. Checking
-    longest-first means a more specific Lookups entry wins over a shorter
-    one that happens to also be a prefix.
+    Sprint 4 Wave 5: contains-match. Lookups description (needle) must be
+    contained within the DIVIDENDS/TRANSACTIONS description (haystack).
+    Longest entry checked first — most specific match wins.
+    Previously used startswith; changed to handle HL verbose strings.
     """
     if not description:
         return None
     for ticker, lookup_desc in lookup_pairs:
-        if description.startswith(lookup_desc):
+        if lookup_desc in description:
             return ticker
     return None
 
 
 def _month_str(date_val):
-    """DIVIDENDS' Month column, "YYYY-MM" -- mirrors the TEXT(date,"YYYY-MM")
-    formula pre-existing rows use, but written as a literal value so it
-    doesn't depend on Excel recalculating formulas for Python-appended rows."""
+    """DIVIDENDS Month column — 'YYYY-MM'."""
     if date_val is None:
         return None
     if isinstance(date_val, datetime):
@@ -765,20 +676,8 @@ def _month_str(date_val):
 
 
 def enrich_dividends(wb, lookup_pairs, run_date, open_tickers=None):
-    """
-    Sweeps every DIVIDENDS row: blank Ticker cells are matched against
-    Lookups via Description (gap-logged if no match); blank Month cells are
-    derived from Date. Returns (matched, gapped, month_filled) counts plus
-    the list of gap dicts (caller logs them to Scheduler alongside Barchart
-    gaps).
-    Sprint 3 Fix 5: open_tickers = set of tickers in PORTFOLIO tab (open
-    positions). A row whose existing Ticker (or a resolved match) is NOT in
-    open_tickers is closed/historical — skip silently, no gap logged.
-    Rows with a blank ticker that fail to match at all are gap-logged only
-    if open_tickers is None (no scoping) — we can't determine open/closed
-    status without a ticker, so we err on the side of logging.
-    """
-    ws = wb["DIVIDENDS"]
+    """Sweep DIVIDENDS: fill blank Ticker (contains-match) and blank Month."""
+    ws      = wb["DIVIDENDS"]
     headers = header_map(ws)
     date_c, desc_c, ticker_c, month_c = (
         headers.get("Date"), headers.get("Description"),
@@ -792,27 +691,25 @@ def enrich_dividends(wb, lookup_pairs, run_date, open_tickers=None):
         if ticker_c:
             existing_ticker = ws.cell(row=row_idx, column=ticker_c).value
             if existing_ticker is not None and str(existing_ticker).strip() != "":
-                # Row already has a ticker — Fix 5: skip if closed position
-                if open_tickers is not None and str(existing_ticker).strip().upper() not in open_tickers:
-                    pass  # closed/historical — skip month fill too (continue below)
-                # else: open position, already has ticker — nothing to do for enrichment
+                # Already has ticker — skip enrichment, check closed-position
+                if open_tickers is not None:
+                    pass  # no action; month fill still runs below
             else:
                 found = match_ticker_by_description(description, lookup_pairs)
                 if found:
-                    # Fix 5: only write+count if open position (or no scoping)
                     if open_tickers is None or found.upper() in open_tickers:
                         write_cell(ws, row_idx, ticker_c, found)
                         matched += 1
-                    # else: closed position match — skip silently, no gap
+                        _log("info", "ENRICH", "DIV_TICKER", found, f"row {row_idx}")
+                    # else: closed position — skip silently
                 elif description:
-                    # No match found — gap-log (can't determine open/closed without ticker)
                     gapped += 1
                     gaps.append(description)
 
         if month_c and date_c:
             existing_month = ws.cell(row=row_idx, column=month_c).value
             if existing_month is None or str(existing_month).strip() == "":
-                date_val = ws.cell(row=row_idx, column=date_c).value
+                date_val  = ws.cell(row=row_idx, column=date_c).value
                 month_val = _month_str(date_val)
                 if month_val:
                     write_cell(ws, row_idx, month_c, month_val)
@@ -820,30 +717,26 @@ def enrich_dividends(wb, lookup_pairs, run_date, open_tickers=None):
 
     gap_records = [
         {
-            "gap_type": "DIVIDENDS Ticker Gap",
-            "source_file": "DIVIDENDS",
-            "ticker": "",
-            "note": f"DIVIDENDS ticker gap — {desc} — manual Lookups update required.",
+            "gap_type":      "DIVIDENDS Ticker Gap",
+            "source_file":   "DIVIDENDS",
+            "ticker":        "",
+            "note":          f"DIVIDENDS ticker gap — {desc} — manual Lookups update required.",
             "detected_date": run_date.date(),
         }
         for desc in gaps
     ]
+    _log("info", "ENRICH", "DIV_SUMMARY", "",
+         f"{matched} matched, {gapped} gap(s), {month_filled} Month filled")
     return matched, gapped, month_filled, gap_records
 
 
 def enrich_portfolio_transactions(wb, lookup_pairs, run_date, open_tickers=None):
     """
-    Sweeps every PORTFOLIO_TRANSACTIONS row with a blank Ticker. Only rows
-    the Reference field resolves to BUY/SELL are candidates for matching --
-    non-trade cash movements (fees, transfers, interest, regular-savings
-    references) legitimately have no ticker and are left blank without
-    being logged as a gap. Returns (matched, gapped) counts plus gap dicts.
-    Sprint 3 Fix 5: open_tickers = set of tickers in PORTFOLIO tab. Matched
-    tickers not in open_tickers are closed/historical — written but not
-    gap-logged; unmatched BUY/SELL rows are still gap-logged (can't confirm
-    closed without a resolved ticker).
+    Sweep PORTFOLIO_TRANSACTIONS: fill blank Ticker via contains-match.
+    BUY/SELL rows only — non-trade cash movements left blank (no gap logged).
+    Sprint 4 Wave 5: contains-match replaces starts-with.
     """
-    ws = wb["PORTFOLIO_TRANSACTIONS"]
+    ws      = wb["PORTFOLIO_TRANSACTIONS"]
     headers = header_map(ws)
     desc_c, ticker_c, ref_c = (
         headers.get("Description"), headers.get("Ticker"), headers.get("Reference"),
@@ -859,50 +752,50 @@ def enrich_portfolio_transactions(wb, lookup_pairs, run_date, open_tickers=None)
 
         reference = ws.cell(row=row_idx, column=ref_c).value if ref_c else None
         if transaction_type_from_reference(reference) not in ("BUY", "SELL"):
-            continue  # cash movement -- no ticker to resolve, not a gap
+            continue  # cash movement — legitimately no ticker
 
         description = ws.cell(row=row_idx, column=desc_c).value if desc_c else None
         found = match_ticker_by_description(description, lookup_pairs)
         if found:
-            # Fix 5: write regardless of open/closed; only gap-log if open
             write_cell(ws, row_idx, ticker_c, found)
             matched += 1
-            if open_tickers is not None and found.upper() not in open_tickers:
-                pass  # closed position — no gap log
+            _log("info", "ENRICH", "TXN_TICKER", found, f"row {row_idx}")
+            # closed position: write but don't gap-log
         elif description:
             gapped += 1
             gaps.append(description)
 
     gap_records = [
         {
-            "gap_type": "PORTFOLIO_TRANSACTIONS Ticker Gap",
-            "source_file": "PORTFOLIO_TRANSACTIONS",
-            "ticker": "",
-            "note": f"PORTFOLIO_TRANSACTIONS ticker gap — {desc} — manual Lookups update required.",
+            "gap_type":      "PORTFOLIO_TRANSACTIONS Ticker Gap",
+            "source_file":   "PORTFOLIO_TRANSACTIONS",
+            "ticker":        "",
+            "note":          f"PORTFOLIO_TRANSACTIONS ticker gap — {desc} — manual Lookups update required.",
             "detected_date": run_date.date(),
         }
         for desc in gaps
     ]
+    _log("info", "ENRICH", "TXN_SUMMARY", "", f"{matched} matched, {gapped} gap(s)")
     return matched, gapped, gap_records
 
 
 # ---------------------------------------------------------------------------
-# Barchart: match-and-update files
+# Barchart: match-and-update
 # ---------------------------------------------------------------------------
 
 def effective_bc_ticker(headers, ws, row_idx):
-    """M_BC_Ticker if populated, else fall back to M_Ticker (per data dict)."""
+    """M_BC_Ticker if populated, else fall back to M_Ticker."""
     bc_col = headers.get("M_BC_Ticker")
     val = ws.cell(row=row_idx, column=bc_col).value if bc_col else None
     if val:
         return str(val)
     m_col = headers.get("M_Ticker")
-    val = ws.cell(row=row_idx, column=m_col).value if m_col else None
+    val   = ws.cell(row=row_idx, column=m_col).value if m_col else None
     return str(val) if val else None
 
 
 def universe_ticker_row_map(ws):
-    """{effective_ticker: row_index} across the whole Universe tab."""
+    """{effective_ticker: row_index} across Universe tab."""
     headers = header_map(ws)
     mapping = {}
     for row_idx in range(2, ws.max_row + 1):
@@ -912,12 +805,19 @@ def universe_ticker_row_map(ws):
     return mapping
 
 
-def process_bc_match_file(wb, filename, cfg, ticker_row_map, sector_etf):
-    rows = read_csv_rows(INPUTS_BC / filename, BC_ENCODING)
-    ws = wb[cfg["sheet"]]
+def process_bc_match_file(wb, filename, cfg, ticker_row_map):
+    """
+    Write Barchart CSV values to Universe tab.
+    Sprint 4 Wave 4: S_Sector derive block REMOVED. S_BC_Sector is written
+    faithfully; S_Sector authority moved to populate_sector_from_lookups()
+    in fetch_engine_weekly.py.
+    """
+    rows    = read_csv_rows(INPUTS_BC / filename, BC_ENCODING)
+    ws      = wb[cfg["sheet"]]
     headers = header_map(ws)
     fill_if_blank = cfg.get("fill_if_blank", set())
 
+    written = 0
     for row in rows:
         ticker = row.get(cfg["source_key"])
         if not ticker or _is_bc_footer_row(ticker) or ticker not in ticker_row_map:
@@ -928,19 +828,18 @@ def process_bc_match_file(wb, filename, cfg, ticker_row_map, sector_etf):
                 if dest_col in fill_if_blank:
                     current = ws.cell(row=row_idx, column=headers[dest_col]).value
                     if current is not None and str(current).strip() != "":
-                        continue  # Sprint 2 Run 5 fix #1: don't overwrite Custom.csv's value
+                        continue
                 field_type = FIELD_TYPES.get(dest_col, "text")
-                value = clean_field_value(row[src_col], field_type)
+                value      = clean_field_value(row[src_col], field_type)
                 write_cell(
                     ws, row_idx, headers[dest_col], value,
                     number_format=_FIELD_TYPE_FORMATS.get(field_type),
                 )
-                # Sprint 2 Run 4 fix #2: alongside the untouched S_BC_Sector
-                # text, also derive the S_Sector ETF abbreviation.
-                if dest_col == "S_BC_Sector" and "S_Sector" in headers:
-                    write_cell(
-                        ws, row_idx, headers["S_Sector"], map_sector(value, sector_etf),
-                    )
+                written += 1
+                # NOTE: S_Sector is NOT derived here. It is authoritative from
+                # Lookups tab via fetch_engine_weekly.populate_sector_from_lookups().
+
+    _log("info", "INGEST", f"BC_{filename}", "", f"{written} cells written")
 
 
 # ---------------------------------------------------------------------------
@@ -954,11 +853,11 @@ def archive_file(src_path, archive_dir, timestamp):
 
 
 # ---------------------------------------------------------------------------
-# Gap detection & Scheduler action items (Barchart only)
+# Gap detection & Scheduler action items
 # ---------------------------------------------------------------------------
 
 def expected_watchlist_tickers(ws):
-    headers = header_map(ws)
+    headers      = header_map(ws)
     watchlist_col = headers.get("M_BC_Watchlist")
     if not watchlist_col:
         return set()
@@ -972,37 +871,27 @@ def expected_watchlist_tickers(ws):
 
 
 def detect_gaps(present_files, expected_tickers, run_date, gap_due_days):
-    """present_files: {filename: set_of_tickers_found_in_file or None if missing}"""
-    gaps = []
-    # Real date objects (not strftime strings) so the Date number_format
-    # applied in log_gaps_to_scheduler actually renders as a date in Excel.
+    gaps          = []
     detected_date = run_date.date() if hasattr(run_date, "date") else run_date
-    due_date = detected_date + timedelta(days=gap_due_days)
+    due_date      = detected_date + timedelta(days=gap_due_days)
     for filename, found_tickers in present_files.items():
         if found_tickers is None:
             gaps.append({
-                "gap_type": "Type A",
-                "source_file": filename,
-                "ticker": "",
+                "gap_type": "Type A", "source_file": filename, "ticker": "",
                 "note": "expected file missing for this run",
-                "detected_date": detected_date,
-                "due_date": due_date,
+                "detected_date": detected_date, "due_date": due_date,
             })
         else:
             for ticker in sorted(expected_tickers - found_tickers):
                 gaps.append({
-                    "gap_type": "Type B",
-                    "source_file": filename,
-                    "ticker": ticker,
+                    "gap_type": "Type B", "source_file": filename, "ticker": ticker,
                     "note": "expected ticker missing from file",
-                    "detected_date": detected_date,
-                    "due_date": due_date,
+                    "detected_date": detected_date, "due_date": due_date,
                 })
     return gaps
 
 
 def find_action_item_header_row(ws):
-    """Locate our own action-item header block if one was already written."""
     for row_idx in range(1, ws.max_row + 1):
         if ws.cell(row=row_idx, column=1).value == ACTION_ITEM_FIELDS[0]:
             return row_idx
@@ -1010,34 +899,23 @@ def find_action_item_header_row(ws):
 
 
 def log_gaps_to_scheduler(wb, gaps, gap_due_days):
-    """
-    Append gap rows to the workbook's Scheduler tab. The Scheduler tab
-    already holds an unrelated manual review table -- our action items get
-    their own header block (written once, below whatever's already there)
-    rather than being interleaved into that table's columns.
-
-    gaps may omit "due_date" (the ticker-enrichment gaps from fixes #2/#3
-    don't set one when built) -- it's backfilled here from detected_date +
-    gap_due_days so every gap type shares the same due-date convention read
-    from the Legend tab.
-    """
     if not gaps:
         return
-    ws = wb[SCHEDULER_SHEET]
+    ws         = wb[SCHEDULER_SHEET]
     header_row = find_action_item_header_row(ws)
     if header_row is None:
-        header_row = ws.max_row + 2  # blank separator line from existing content
+        header_row = ws.max_row + 2
         for col_idx, name in enumerate(ACTION_ITEM_FIELDS, start=1):
             write_cell(ws, header_row, col_idx, name)
 
     next_row = ws.max_row + 1
     for gap in gaps:
         detected_date = gap["detected_date"]
-        due_date = gap.get("due_date") or (detected_date + timedelta(days=gap_due_days))
-        row_values = dict(gap, due_date=due_date)
+        due_date      = gap.get("due_date") or (detected_date + timedelta(days=gap_due_days))
+        row_values    = dict(gap, due_date=due_date)
         for col_idx, field in enumerate(ACTION_ITEM_FIELDS, start=1):
             value = row_values[field]
-            fmt = NUMBER_FORMAT_DATE if field in ("detected_date", "due_date") else None
+            fmt   = NUMBER_FORMAT_DATE if field in ("detected_date", "due_date") else None
             write_cell(ws, next_row, col_idx, value, number_format=fmt)
         next_row += 1
 
@@ -1047,76 +925,80 @@ def log_gaps_to_scheduler(wb, gaps, gap_due_days):
 # ---------------------------------------------------------------------------
 
 def run(workbook_path=None):
-    run_date = datetime.now()
+    _ctx["run_id"] = str(uuid.uuid4())[:8]
+    _ctx["uid"]    = ""  # ICU user sessions not yet wired
+
+    run_date  = datetime.now()
     timestamp = run_date.strftime("%Y%m%d_%H%M%S")
 
+    _log("info", "STARTUP", "RUN_START", "",
+         f"portfolio_csv_ingestion starting — wb={workbook_path or 'auto'}")
+
     resolved_by_glob = workbook_path is None
-    workbook_path = find_workbook() if resolved_by_glob else Path(workbook_path)
+    workbook_path    = find_workbook() if resolved_by_glob else Path(workbook_path)
 
     wb = openpyxl.load_workbook(
         workbook_path, keep_vba=workbook_path.suffix == ".xlsm"
     )
 
-    # --- Sprint 2 Run 5 fix #5: Legend tab as source of truth ---
     legend_scalars = read_legend_scalars(wb, ["GAP_DUE_DAYS"])
-    gap_due_days = int(legend_scalars["GAP_DUE_DAYS"])
-    sector_etf = read_legend_lookup_table(wb, "SECTOR ETF LOOKUP")
+    gap_due_days   = int(legend_scalars["GAP_DUE_DAYS"])
 
-    # --- Sprint 3: processing order ---
-    # 1. CSV → PORTFOLIO (update existing + insert new)
-    # 2. PORTFOLIO → Universe S_ columns
-    # 3. Ticker enrichment sweeps (DIVIDENDS + PORTFOLIO_TRANSACTIONS via Lookups)
-    # 4. Barchart processing
-    # 5. Gap logging to Scheduler
+    # Build lookup_pairs early — used for DIVIDENDS dedup pre-enrichment
+    try:
+        lookup_pairs = build_lookup_pairs(wb)
+        _log("info", "STARTUP", "LOOKUPS_LOAD", "",
+             f"{len(lookup_pairs)} Lookups pairs loaded")
+    except KeyError as exc:
+        _log("error", "STARTUP", "LOOKUPS_LOAD", "", str(exc))
+        lookup_pairs = []
 
-    # --- Step 1: HL match files (account-summary.csv → PORTFOLIO) ---
-    for filename, cfg in HL_MATCH_FILES.items():
-        path = INPUTS_HL / filename
-        if path.exists():
-            try:
-                process_hl_match_file(wb, filename, cfg)
-                archive_file(path, ARCHIVE_HL, timestamp)
-            except Exception as exc:
-                print(f"[SKIP] {filename}: {exc}")
+    # --- Step 1: PORTFOLIO clear-and-rewrite (Wave 5) ---
+    portfolio_path = INPUTS_HL / HL_PORTFOLIO_FILE
+    if portfolio_path.exists():
+        _log("info", "INGEST", "PORTFOLIO_START", "",
+             f"Processing {HL_PORTFOLIO_FILE}")
+        try:
+            process_hl_portfolio_rewrite(wb, HL_PORTFOLIO_FILE, HL_PORTFOLIO_CFG)
+            archive_file(portfolio_path, ARCHIVE_HL, timestamp)
+        except Exception as exc:
+            _log("error", "INGEST", "PORTFOLIO_ERR", "", str(exc))
 
-    # --- Step 1b: HL append files (trade history, dividends) ---
+    # --- Step 1b: HL append files ---
     for filename, sheet_name in HL_APPEND_FILES.items():
         path = INPUTS_HL / filename
         if path.exists():
+            _log("info", "INGEST", "APPEND_START", "",
+                 f"Processing {filename} -> {sheet_name}")
             try:
-                appended, skipped = process_hl_append_file(wb, filename, sheet_name)
+                lp = lookup_pairs if sheet_name == "DIVIDENDS" else None
+                process_hl_append_file(wb, filename, sheet_name, lookup_pairs=lp)
                 archive_file(path, ARCHIVE_HL, timestamp)
-                print(f"  {filename}: {appended} row(s) appended, {skipped} duplicate(s) skipped.")
             except Exception as exc:
-                print(f"[SKIP] {filename}: {exc}")
+                _log("error", "INGEST", "APPEND_ERR", "", f"{filename}: {exc}")
 
-    # --- Step 2: PORTFOLIO → Universe S_ columns (Sprint 3 Fix 3) ---
+    # --- Step 2: PORTFOLIO -> Universe S_ columns ---
+    _log("info", "INGEST", "PORT_TO_UNI_START", "", "Pushing S_ columns to Universe")
     try:
         portfolio_to_universe_s_cols(wb)
     except Exception as exc:
-        print(f"[SKIP] PORTFOLIO→Universe S_ write: {exc}")
+        _log("error", "INGEST", "PORT_TO_UNI_ERR", "", str(exc))
 
-    # --- Step 3: Ticker enrichment + Month (Sprint 3 Fix 5: open-position scoping) ---
+    # --- Step 3: Ticker enrichment + Month ---
+    _log("info", "ENRICH", "ENRICH_START", "", "Running ticker enrichment sweeps")
     open_tickers = open_position_tickers(wb)
-    lookup_pairs = build_lookup_pairs(wb)
+
     div_matched, div_gapped, month_filled, div_gap_records = enrich_dividends(
         wb, lookup_pairs, run_date, open_tickers=open_tickers
     )
     pt_matched, pt_gapped, pt_gap_records = enrich_portfolio_transactions(
         wb, lookup_pairs, run_date, open_tickers=open_tickers
     )
-    print(
-        f"  DIVIDENDS ticker enrichment: {div_matched} matched, {div_gapped} gap(s) "
-        f"logged, {month_filled} Month value(s) backfilled."
-    )
-    print(
-        f"  PORTFOLIO_TRANSACTIONS ticker enrichment: {pt_matched} matched, "
-        f"{pt_gapped} gap(s) logged."
-    )
 
-    # --- Step 4: Barchart inputs: process any present, track presence for gaps ---
-    universe_ws = wb["Universe"]
-    ticker_row_map = universe_ticker_row_map(universe_ws)
+    # --- Step 4: Barchart inputs ---
+    _log("info", "INGEST", "BC_START", "", "Processing Barchart inputs")
+    universe_ws      = wb["Universe"]
+    ticker_row_map   = universe_ticker_row_map(universe_ws)
     expected_tickers = expected_watchlist_tickers(universe_ws)
 
     present_files = {}
@@ -1129,16 +1011,17 @@ def run(workbook_path=None):
                     r[cfg["source_key"]] for r in rows
                     if r.get(cfg["source_key"]) and not _is_bc_footer_row(r[cfg["source_key"]])
                 }
-                process_bc_match_file(wb, filename, cfg, ticker_row_map, sector_etf)
+                process_bc_match_file(wb, filename, cfg, ticker_row_map)
                 archive_file(path, ARCHIVE_BC, timestamp)
                 present_files[filename] = found_tickers
             except Exception as exc:
-                print(f"[SKIP] {filename}: {exc}")
+                _log("error", "INGEST", "BC_ERR", "", f"{filename}: {exc}")
                 present_files[filename] = None
         else:
             present_files[filename] = None
 
-    gaps = detect_gaps(present_files, expected_tickers, run_date, gap_due_days)
+    # --- Step 5: Gap logging ---
+    gaps     = detect_gaps(present_files, expected_tickers, run_date, gap_due_days)
     all_gaps = gaps + div_gap_records + pt_gap_records
     log_gaps_to_scheduler(wb, all_gaps, gap_due_days)
 
@@ -1147,10 +1030,9 @@ def run(workbook_path=None):
     else:
         wb.save(workbook_path)
 
-    print(
-        f"Run complete. {len(gaps)} Barchart gap(s), {div_gapped + pt_gapped} "
-        f"ticker gap(s) logged to Scheduler tab. Workbook: {workbook_path.name}"
-    )
+    _log("info", "COMPLETE", "RUN_END", "",
+         f"{len(gaps)} BC gap(s), {div_gapped + pt_gapped} ticker gap(s). "
+         f"Workbook: {workbook_path.name}")
     return wb
 
 

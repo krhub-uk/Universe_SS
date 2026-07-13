@@ -1,7 +1,7 @@
 """
-Price Action Script — EOD cadence
-Spec: 00_Portfolio_Automation_Spec_V3.8.md, Section 7b. Sprint 2 script
-re-engineering: replaces the EOD scope of price_action_4h.py.
+Price Action Script -- EOD cadence
+Spec: 00_Portfolio_Automation_Spec_V5.5.md, Section 7b. Sprint 4.
+Originally: Sprint 2 script re-engineering, replaces EOD scope of price_action_4h.py.
 
 Runs: EOD (11pm).
 
@@ -12,7 +12,7 @@ Scope each run:
 
 S_ columns fed -- all 9 intraday attributes (see price_action_intraday.py)
 PLUS:
-    S_Daily_Close, S_LastClose_Volume, S_1W_Change_%, S_2W_Change_%,
+    S_Daily_Close, S_LastClose_Volume, S_1W_Change_Pct, S_2W_Change_Pct,
     S_52W_High, S_52W_Low
 
 D_ columns computed this run (after price fetch):
@@ -32,9 +32,9 @@ are present, skip silently -- no error, no log noise beyond a one-line note.
 
 Notes on scope decisions not fully specified in §7b itself:
   - §7b's literal text says history(period="5d") for the change-% calcs.
-    A 5-day pull can support S_1D/2D/3D_Change_% (same as
-    price_action_intraday.py) and marginally S_1W_Change_% (needs 6 rows;
-    "5d" typically returns ~5), but cannot support S_2W_Change_% at all --
+    A 5-day pull can support S_1D/2D/3D_Change_Pct (same as
+    price_action_intraday.py) and marginally S_1W_Change_Pct (needs 6 rows;
+    "5d" typically returns ~5), but cannot support S_2W_Change_Pct at all --
     a 2-week-back close needs ~10 trading days of history, which a 5-day
     pull structurally cannot contain, regardless of how the comparison is
     indexed. Raised with the user directly; resolved as: pull
@@ -75,6 +75,9 @@ openpyxl constraint (§1): surgical cell edits only, never a pandas
 rewrite of the sheet -- column dtypes/formatting must survive.
 """
 
+import logging
+import sys
+import uuid
 import numpy as np
 import yfinance as yf
 from datetime import datetime
@@ -83,6 +86,7 @@ from pathlib import Path
 import openpyxl
 
 from workbook_io import (
+    BASE_PATH,
     find_workbook,
     save_workbook_with_increment,
     write_cell,
@@ -93,6 +97,39 @@ from workbook_io import (
     NUMBER_FORMAT_PERCENT_SCALED,
     NUMBER_FORMAT_PERCENT_FRACTION,
 )
+
+# ---------------------------------------------------------------------------
+# Logging (Wave 8)
+# ---------------------------------------------------------------------------
+
+LOG_DIR = BASE_PATH / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "price_action_eod.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("price_action_eod")
+
+_ctx: dict = {}
+_VOCAB_KEYS = ("PHASE=", "ACTION=", "TICKER=", "RUN_ID=", "UID=")
+
+
+def _log(level: str, phase: str, action: str, ticker: str, message: str) -> None:
+    run_id = _ctx.get("run_id", "")
+    uid    = _ctx.get("uid", "")
+    line   = (
+        f"PHASE={phase} ACTION={action} TICKER={ticker} "
+        f"RUN_ID={run_id} UID={uid} | {message}"
+    )
+    for key in _VOCAB_KEYS:
+        if key not in line:
+            log.warning(f"[VOCAB_FAIL] Missing {key}")
+    getattr(log, level.lower())(line)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -112,12 +149,12 @@ LEGEND_THRESHOLD_KEYS = [
 S_COLUMNS_INTRADAY = [
     "S_Daily_High", "S_Daily_Low", "S_Daily_Open",
     "S_Last_Price", "S_Current_Price", "S_LastTradedTime",
-    "S_1D_Change_%", "S_2D_Change_%", "S_3D_Change_%",
+    "S_1D_Change_Pct", "S_2D_Change_Pct", "S_3D_Change_Pct",  # Wave 4 renames
 ]
 
 S_COLUMNS_EOD_ONLY = [
     "S_Daily_Close", "S_LastClose_Volume",
-    "S_1W_Change_%", "S_2W_Change_%",
+    "S_1W_Change_Pct", "S_2W_Change_Pct",  # Wave 4 renames
     "S_52W_High", "S_52W_Low",
 ]
 
@@ -130,27 +167,27 @@ D_COLUMNS_EOD = [
 ]
 
 FIELD_TYPES = {
-    "S_Daily_High": "number",
-    "S_Daily_Low": "number",
-    "S_Daily_Open": "number",
-    "S_Last_Price": "number",
-    "S_Current_Price": "number",
-    "S_LastTradedTime": "text",
-    "S_1D_Change_%": "percent_scaled",
-    "S_2D_Change_%": "percent_scaled",
-    "S_3D_Change_%": "percent_scaled",
-    "S_Daily_Close": "number",
+    "S_Daily_High":       "number",
+    "S_Daily_Low":        "number",
+    "S_Daily_Open":       "number",
+    "S_Last_Price":       "number",
+    "S_Current_Price":    "number",
+    "S_LastTradedTime":   "text",
+    "S_1D_Change_Pct":    "percent_scaled",   # Wave 4 renames
+    "S_2D_Change_Pct":    "percent_scaled",
+    "S_3D_Change_Pct":    "percent_scaled",
+    "S_Daily_Close":      "number",
     "S_LastClose_Volume": "number",
-    "S_1W_Change_%": "percent_scaled",
-    "S_2W_Change_%": "percent_scaled",
-    "S_52W_High": "number",
-    "S_52W_Low": "number",
-    "D_Volume_Delta_%": "percent_scaled",
-    "D_Volume_Flag": "text",
-    "D_Cap_Candle_Mid": "number",
-    "D_Close_Direction": "text",
-    "D_Context_Flag": "text",
-    "D_Cap_Mid_Anchor": "number",
+    "S_1W_Change_Pct":    "percent_scaled",   # Wave 4 renames
+    "S_2W_Change_Pct":    "percent_scaled",
+    "S_52W_High":         "number",
+    "S_52W_Low":          "number",
+    "D_Volume_Delta_%":   "percent_scaled",   # NOT renamed per spec
+    "D_Volume_Flag":      "text",
+    "D_Cap_Candle_Mid":   "number",
+    "D_Close_Direction":  "text",
+    "D_Context_Flag":     "text",
+    "D_Cap_Mid_Anchor":   "number",
     "D_Cap_Anchor_Active": "text",
     "D_Price_vs_Cap_Mid": "percent_fraction",
     "D_Price_vs_52W_High": "percent_fraction",
@@ -251,11 +288,11 @@ def fetch_price_action(symbol):
         "S_Last_Price": last_price,
         "S_Current_Price": last_price,
         "S_LastTradedTime": hist_1d.index[-1].strftime("%Y-%m-%d %H:%M:%S"),
-        "S_1D_Change_%": pct_change(1),
-        "S_2D_Change_%": pct_change(2),
-        "S_3D_Change_%": pct_change(3),
-        "S_1W_Change_%": pct_change(5),
-        "S_2W_Change_%": pct_change(10),
+        "S_1D_Change_Pct": pct_change(1),   # Wave 4 renames
+        "S_2D_Change_Pct": pct_change(2),
+        "S_3D_Change_Pct": pct_change(3),
+        "S_1W_Change_Pct": pct_change(5),
+        "S_2W_Change_Pct": pct_change(10),
         "S_52W_High": info.get("fiftyTwoWeekHigh") if info else None,
         "S_52W_Low": info.get("fiftyTwoWeekLow") if info else None,
     }
@@ -400,16 +437,22 @@ def run(workbook_path=None, run_date=None):
     explicit path is passed (e.g. by the test harness), it's used as-is
     and saved in place.
     """
-    run_date = run_date or datetime.now()
+    _ctx["run_id"] = str(uuid.uuid4())[:8]
+    _ctx["uid"]    = ""
+
+    start    = datetime.now()
+    run_date = run_date or start
+    _log("info", "STARTUP", "RUN_START", "", "price_action_eod.py starting")
+
     resolved_by_glob = workbook_path is None
-    workbook_path = find_workbook() if resolved_by_glob else Path(workbook_path)
+    workbook_path    = find_workbook() if resolved_by_glob else Path(workbook_path)
 
     wb = openpyxl.load_workbook(workbook_path, keep_vba=str(workbook_path).endswith(".xlsm"))
     ws = wb[SHEET_NAME]
     headers = header_map(ws)
 
     legend_scalars = read_legend_scalars(wb, LEGEND_THRESHOLD_KEYS)
-    thresholds = {k: float(v) for k, v in legend_scalars.items()}
+    thresholds     = {k: float(v) for k, v in legend_scalars.items()}
 
     processed, skipped = 0, 0
     for row_idx in range(2, ws.max_row + 1):
@@ -421,8 +464,10 @@ def run(workbook_path=None, run_date=None):
             skipped += 1
             continue
 
+        _log("info", "FETCH", "TICKER_START", symbol, f"row {row_idx}")
         s_values = fetch_price_action(symbol)
         if s_values is None:
+            _log("warning", "FETCH", "TICKER_SKIP", symbol, "fetch returned None")
             skipped += 1
             continue
 
@@ -430,10 +475,10 @@ def run(workbook_path=None, run_date=None):
             set_cell(ws, headers, row_idx, col_name, s_values[col_name])
 
         existing = {
-            "D_Cap_Mid_Anchor": get_cell(ws, headers, row_idx, "D_Cap_Mid_Anchor"),
-            "D_Cap_Anchor_Date": get_cell(ws, headers, row_idx, "D_Cap_Anchor_Date"),
+            "D_Cap_Mid_Anchor":    get_cell(ws, headers, row_idx, "D_Cap_Mid_Anchor"),
+            "D_Cap_Anchor_Date":   get_cell(ws, headers, row_idx, "D_Cap_Anchor_Date"),
             "D_Cap_Anchor_Active": get_cell(ws, headers, row_idx, "D_Cap_Anchor_Active"),
-            "_anchor_magnitude": get_cell(ws, headers, row_idx, "D_Volume_Delta_%"),
+            "_anchor_magnitude":   get_cell(ws, headers, row_idx, "D_Volume_Delta_%"),
         }
         average_volume = get_cell(ws, headers, row_idx, "S_Average_Volume")
         d_values = compute_derived(s_values, existing, average_volume, run_date, thresholds)
@@ -447,15 +492,17 @@ def run(workbook_path=None, run_date=None):
     else:
         wb.save(workbook_path)
 
-    print(f"Run complete (EOD). {processed} row(s) updated, {skipped} skipped. Workbook: {workbook_path.name}")
+    elapsed = str(datetime.now() - start).split(".")[0]
+    _log("info", "COMPLETE", "RUN_END", "",
+         f"{processed} row(s) updated, {skipped} skipped. Duration {elapsed}")
 
     # --- §7b: trigger CSV ingestion if any input files are present ---
     if csv_inputs_present():
         import portfolio_csv_ingestion
-        print("  CSV input(s) detected in Inputs/HL or Inputs/BC -- running portfolio_csv_ingestion.run()")
+        _log("info", "INGEST", "CSV_TRIGGER", "", "CSV inputs detected -- calling portfolio_csv_ingestion.run()")
         portfolio_csv_ingestion.run(workbook_path=None if resolved_by_glob else workbook_path)
     else:
-        print("  No CSV inputs present in Inputs/HL or Inputs/BC -- skipping ingestion.")
+        _log("info", "INGEST", "CSV_SKIP", "", "No CSV inputs present -- skipping ingestion")
 
     return wb
 

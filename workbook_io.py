@@ -235,15 +235,31 @@ NUMBER_FORMAT_PERCENT_FRACTION = "0.00%"   # value is a true fraction e.g. 0.050
 NUMBER_FORMAT_DATE = "yyyy-mm-dd"
 
 
+def _vals_equal(current, new):
+    """True if the cell already holds the value we would write.
+    None and "" are both treated as empty — writing "" to a None cell is a
+    no-op. Sprint 4: universal conditional cell write guard.
+    """
+    c_empty = current is None or current == ""
+    n_empty = new is None or new == ""
+    if c_empty and n_empty:
+        return True
+    if c_empty != n_empty:
+        return False
+    return current == new
+
+
 def write_cell(ws, row, column, value, number_format=None):
     """
-    Write value to ws.cell(row, column), mark it as script-written (font
-    size 12), and optionally apply a number_format (use the
-    NUMBER_FORMAT_* constants above). Every write path in the three
-    ingestion/fetch scripts should go through this instead of calling
-    ws.cell(..., value=...) directly, so fixes #4 and #6 stay consistent.
+    Conditional write: reads the current cell value first. Only writes and
+    applies font.size=12 if the value differs. Unchanged cells are untouched
+    — font stays at 8 (default). Sprint 4: universal conditional cell write
+    guard applied to every script via this single choke-point.
     """
-    cell = ws.cell(row=row, column=column, value=value)
+    cell = ws.cell(row=row, column=column)
+    if _vals_equal(cell.value, value):
+        return cell  # no change — leave cell and font completely untouched
+    cell.value = value
     f = cell.font
     cell.font = Font(
         name=f.name, size=WRITTEN_FONT_SIZE, bold=f.bold, italic=f.italic,
