@@ -730,24 +730,45 @@ def enrich_dividends(wb, lookup_pairs, run_date, open_tickers=None):
     return matched, gapped, month_filled, gap_records
 
 
+
+# Sentinel values a user can write into the Ticker column to permanently
+# suppress enrichment attempts on closed / irrelevant transaction rows.
+# Rows carrying any of these values are skipped silently — no gap logged.
+TICKER_SKIP_INDICATORS = {"IGNORE", "CLOSED"}
+
+
 def enrich_portfolio_transactions(wb, lookup_pairs, run_date, open_tickers=None):
     """
     Sweep PORTFOLIO_TRANSACTIONS: fill blank Ticker via contains-match.
     BUY/SELL rows only — non-trade cash movements left blank (no gap logged).
     Sprint 4 Wave 5: contains-match replaces starts-with.
+
+    Skip indicators: if the Ticker cell already contains a value from
+    TICKER_SKIP_INDICATORS ("IGNORE" or "CLOSED"), the row is skipped
+    silently — no enrichment attempted, no gap logged. This lets closed /
+    irrelevant positions be permanently suppressed by Kyle without generating
+    Scheduler errors.
     """
     ws      = wb["PORTFOLIO_TRANSACTIONS"]
     headers = header_map(ws)
     desc_c, ticker_c, ref_c = (
         headers.get("Description"), headers.get("Ticker"), headers.get("Reference"),
     )
-    matched, gapped = 0, 0
+    matched, gapped, skipped = 0, 0, 0
     gaps = []
     for row_idx in range(2, ws.max_row + 1):
         if ticker_c is None:
             break
         existing_ticker = ws.cell(row=row_idx, column=ticker_c).value
-        if existing_ticker is not None and str(existing_ticker).strip() != "":
+        existing_str    = str(existing_ticker).strip().upper() if existing_ticker is not None else ""
+
+        # Skip indicators: user-set sentinels for closed / irrelevant rows
+        if existing_str in TICKER_SKIP_INDICATORS:
+            skipped += 1
+            continue
+
+        # Already has a real ticker — nothing to do
+        if existing_str != "":
             continue
 
         reference = ws.cell(row=row_idx, column=ref_c).value if ref_c else None
@@ -775,7 +796,8 @@ def enrich_portfolio_transactions(wb, lookup_pairs, run_date, open_tickers=None)
         }
         for desc in gaps
     ]
-    _log("info", "ENRICH", "TXN_SUMMARY", "", f"{matched} matched, {gapped} gap(s)")
+    _log("info", "ENRICH", "TXN_SUMMARY", "",
+         f"{matched} matched, {gapped} gap(s), {skipped} skipped (IGNORE/CLOSED)")
     return matched, gapped, gap_records
 
 
@@ -1020,8 +1042,7 @@ def run(workbook_path=None):
         else:
             present_files[filename] = None
 
-    # --- Step 5: Gap logging ---
-    gaps     = detect_gaps(present_files, expected_tickers, run_date, gap_due_days)
+    gaps = detect_gaps(present_files, expected_tickers, run_date, gap_due_days)
     all_gaps = gaps + div_gap_records + pt_gap_records
     log_gaps_to_scheduler(wb, all_gaps, gap_due_days)
 
@@ -1031,10 +1052,12 @@ def run(workbook_path=None):
         wb.save(workbook_path)
 
     _log("info", "COMPLETE", "RUN_END", "",
-         f"{len(gaps)} BC gap(s), {div_gapped + pt_gapped} ticker gap(s). "
-         f"Workbook: {workbook_path.name}")
+         f"{len(gaps)} Barchart gap(s), {div_gapped + pt_gapped} ticker gap(s) "
+         f"logged to Scheduler. Workbook: {workbook_path.name}")
     return wb
 
 
 if __name__ == "__main__":
+    run()
+:
     run()
