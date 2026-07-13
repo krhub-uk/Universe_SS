@@ -163,7 +163,7 @@ S_COLUMNS_ALL = S_COLUMNS_INTRADAY + S_COLUMNS_EOD_ONLY
 D_COLUMNS_EOD = [
     "D_Volume_Delta_%", "D_Volume_Flag", "D_Cap_Candle_Mid", "D_Close_Direction",
     "D_Context_Flag", "D_Cap_Mid_Anchor", "D_Cap_Anchor_Date",
-    "D_Cap_Anchor_Active", "D_Price_vs_Cap_Mid", "D_Price_vs_52W_High",
+    "D_Cap_Anchor_Active", "D_Price_vs_Cap_Mid_Pct", "D_Price_vs_52W_High_Pct",
 ]
 
 FIELD_TYPES = {
@@ -189,8 +189,8 @@ FIELD_TYPES = {
     "D_Context_Flag":     "text",
     "D_Cap_Mid_Anchor":   "number",
     "D_Cap_Anchor_Active": "text",
-    "D_Price_vs_Cap_Mid": "percent_fraction",
-    "D_Price_vs_52W_High": "percent_fraction",
+    "D_Price_vs_Cap_Mid_Pct":  "number",   # stored x100, e.g. -3.2 = 3.2% below mid
+    "D_Price_vs_52W_High_Pct": "number",   # stored x100
 }
 
 _FIELD_TYPE_FORMATS = {
@@ -365,7 +365,9 @@ def compute_derived(s_values, existing, average_volume, run_date, thresholds):
     else:
         context_flag = None
 
-    price_vs_cap_mid = (close - cap_mid) / cap_mid if cap_mid else None
+    price_vs_cap_mid = (
+        round((close - cap_mid) / cap_mid * 100, 4) if cap_mid else None
+    )
 
     # --- Anchor persistence state machine (§6) ---
     anchor = existing.get("D_Cap_Mid_Anchor")
@@ -394,23 +396,24 @@ def compute_derived(s_values, existing, average_volume, run_date, thresholds):
             anchor_date = run_date.strftime("%Y-%m-%d")
             anchor_active = True
 
-    # --- D_Price_vs_52W_High (§20) ---
+    # --- D_Price_vs_52W_High_Pct (stored x100 per _Pct convention) ---
     high_52w = s_values.get("S_52W_High")
-    price_vs_52w_high = (
-        (s_values["S_Last_Price"] - high_52w) / high_52w if high_52w else None
+    price_vs_52w_high_pct = (
+        round((s_values["S_Last_Price"] - high_52w) / high_52w * 100, 4)
+        if high_52w else None
     )
 
     return {
-        "D_Volume_Delta_%": volume_delta_pct,
-        "D_Volume_Flag": volume_flag,
-        "D_Cap_Candle_Mid": cap_mid,
-        "D_Close_Direction": close_direction,
-        "D_Context_Flag": context_flag,
-        "D_Cap_Mid_Anchor": anchor,
-        "D_Cap_Anchor_Date": anchor_date,
-        "D_Cap_Anchor_Active": "Y" if anchor_active else None,
-        "D_Price_vs_Cap_Mid": price_vs_cap_mid,
-        "D_Price_vs_52W_High": price_vs_52w_high,
+        "D_Volume_Delta_%":     volume_delta_pct,
+        "D_Volume_Flag":        volume_flag,
+        "D_Cap_Candle_Mid":     cap_mid,
+        "D_Close_Direction":    close_direction,
+        "D_Context_Flag":       context_flag,
+        "D_Cap_Mid_Anchor":     anchor,
+        "D_Cap_Anchor_Date":    anchor_date,
+        "D_Cap_Anchor_Active":  "Y" if anchor_active else None,
+        "D_Price_vs_Cap_Mid_Pct":  price_vs_cap_mid,
+        "D_Price_vs_52W_High_Pct": price_vs_52w_high_pct,
     }
 
 

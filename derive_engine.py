@@ -381,19 +381,27 @@ def run():
         # D_Income_Payback_Pct = D_All_Income / S_CostBasis x 100
         # Wave 3: stored as x100 (raw %) per _Pct convention.
         cost_basis = row[cm["S_CostBasis"]] if "S_CostBasis" in cm else None
-        if all_income and cost_basis:
+        try:
+            cb_float = float(cost_basis) if (cost_basis is not None and cost_basis != "") else None
+        except (TypeError, ValueError):
+            cb_float = None
+        if all_income and cb_float:
             try:
                 computed[i]["D_Income_Payback_Pct"] = round(
-                    all_income / float(cost_basis) * 100, 4
+                    all_income / cb_float * 100, 4
                 )
-            except (TypeError, ValueError, ZeroDivisionError):
+            except ZeroDivisionError:
                 computed[i]["D_Income_Payback_Pct"] = ""
         else:
             computed[i]["D_Income_Payback_Pct"] = ""
 
         mkt_val = row[cm["S_MarketValue_GBP"]] if "S_MarketValue_GBP" in cm else None
-        if mkt_val:
-            total_portfolio_value += float(mkt_val)
+        try:
+            if mkt_val is not None and mkt_val != "":
+                total_portfolio_value += float(mkt_val)
+        except (TypeError, ValueError):
+            _log("warning", "DERIVE", "MKT_VAL_SKIP", str(ticker or ""),
+                 f"S_MarketValue_GBP non-numeric: {mkt_val!r} — excluded from portfolio total")
 
     _log("info", "DERIVE", "PORTFOLIO_VALUE", "",
          f"Total portfolio value: {total_portfolio_value:,.2f}")
@@ -450,9 +458,9 @@ def run():
         elim = row[cm["M_Eliminated"]] if "M_Eliminated" in cm else None
         if elim == "No Touch":
             computed[i].update({
-                "D_PE_Discount":       "",
-                "D_Yield_Premium_Pct": "",
-                "D_Price_vs_52W_High": "",
+                "D_PE_Discount":           "",
+                "D_Yield_Premium_Pct":     "",
+                "D_Price_vs_52W_High_Pct": "",
             })
             continue
 
@@ -474,14 +482,14 @@ def run():
             if (yld is not None and yavg is not None) else ""
         )
         p52 = (
-            round((float(price) - float(high)) / float(high), 4)
+            round((float(price) - float(high)) / float(high) * 100, 4)
             if (price and high and float(high) != 0) else ""
         )
 
         computed[i].update({
-            "D_PE_Discount":       pe_disc,
-            "D_Yield_Premium_Pct": yld_prem,
-            "D_Price_vs_52W_High": p52,
+            "D_PE_Discount":          pe_disc,
+            "D_Yield_Premium_Pct":    yld_prem,
+            "D_Price_vs_52W_High_Pct": p52,   # renamed + x100
         })
 
     # -- Step 4: Sell Board signals --------------------------------------------

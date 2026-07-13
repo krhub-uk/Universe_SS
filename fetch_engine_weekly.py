@@ -260,7 +260,8 @@ def _unix_to_date_str(ts):
     if ts is None:
         return None
     try:
-        return datetime.utcfromtimestamp(ts).date()
+        from datetime import timezone
+        return datetime.fromtimestamp(ts, tz=timezone.utc).date()
     except (TypeError, ValueError, OSError):
         return None
 
@@ -269,7 +270,8 @@ def _unix_to_datetime_str(ts):
     if ts is None:
         return None
     try:
-        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        from datetime import timezone
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError, OSError):
         return None
 

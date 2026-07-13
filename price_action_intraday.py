@@ -1,61 +1,54 @@
 """
-Price Action Script — Intraday cadence
-Spec: 00_Portfolio_Automation_Spec_V3.8.md, Section 7a. Sprint 2 script
-re-engineering: replaces the 1H/4H scope of price_action_4h.py.
+Price Action Script -- Intraday cadence
+Spec: 00_Portfolio_Automation_Spec_V5.5.md, Section 7a. Sprint 4.
+Originally: Sprint 2 script re-engineering, replaces 1H/4H scope of price_action_4h.py.
 
 Runs: 1H/4H cadence (11am / 3pm / 7pm, or hourly -- schedule is external to
 this script; every run behaves identically).
 
 Scope each run:
     M_Eliminated != "No Touch"   (universal kill switch, checked first)
-    -- all rows, all sleeves. No M_Fetch_Cadence filter (§7a: cadence is
+    -- all rows, all sleeves. No M_Fetch_Cadence filter (cadence is
     now governed by the run schedule, not a per-row column check).
 
 S_ columns fed (9 attributes only):
     S_Daily_High, S_Daily_Low, S_Daily_Open, S_Last_Price, S_Current_Price,
-    S_LastTradedTime, S_1D_Change_%, S_2D_Change_%, S_3D_Change_%
+    S_LastTradedTime, S_1D_Change_Pct, S_2D_Change_Pct, S_3D_Change_Pct
 
 No D_ columns. No CSV ingestion. No cadence filter.
 
-Source: one yfinance Ticker.history() call per row, no `.info[]` calls.
+Source: one yfinance Ticker.history() call per row, no .info[] calls.
 
 Notes on scope decisions not fully specified in §7a itself:
   - §7a's literal text says "history(1d) only" as the lightest possible YF
     call. A single history(period="1d") pull returns exactly one daily bar,
-    which cannot support S_1D/2D/3D_Change_% (each needs a prior close N
-    trading days back). Raised with the user directly (see conversation) --
-    resolved as: pull history(period="5d") instead (still one Ticker call,
-    still zero .info[] calls, so the "lightest possible / no .info" intent
-    is preserved) so the three change-% columns actually compute. This is a
-    deliberate deviation from the literal "1d" period string, not an
-    oversight.
-  - S_Current_Price / S_Last_Price: the Data Dictionary (§20) sources both
-    from `info['currentPrice']`, but §7a bans `.info[]` calls entirely for
-    this script. Both are set from the latest daily bar's Close instead
-    (same value price_action_4h.py already used for S_Last_Price) -- the
-    two columns are aliases of each other per the Data Dictionary note, so
-    this preserves that relationship even without a live quote. Flagged,
-    not solved: this makes both fields "last close", not a true
-    intraday tick price to yfinance's fastinfo, an option if that's
-    revisited later.
-  - S_LastTradedTime: Data Dictionary just says "YF", normally
-    `info['regularMarketTime']` (see fetch_engine_monthly.py), unavailable
-    here without `.info[]`. Uses the timestamp of the latest returned bar
-    (hist.index[-1]) instead, formatted "YYYY-MM-DD HH:MM:SS".
-  - Ticker symbol resolution: same S_YF_Ticker -> M_Ticker fallback as
-    price_action_4h.py / fetch_engine_monthly.py.
+    which cannot support S_1D/2D/3D_Change_Pct (each needs a prior close N
+    trading days back). Raised with the user directly -- resolved as: pull
+    history(period="5d") instead (still one Ticker call, still zero .info[]
+    calls) so the three change-% columns actually compute.
+  - S_Current_Price / S_Last_Price: both set from the latest daily bar's
+    Close -- true intraday tick not available without .info[].
+  - S_LastTradedTime: uses the timestamp of the latest returned bar
+    (hist.index[-1]) formatted "YYYY-MM-DD HH:MM:SS".
+  - Column names S_1D/2D/3D_Change_Pct: Sprint 4 Wave 4 rename from _%.
 
-openpyxl constraint (§1): surgical cell edits only, never a pandas
-rewrite of the sheet -- column dtypes/formatting must survive.
+Wave 8: Structured PHASE/ACTION/TICKER/RUN_ID/UID logging.
+
+openpyxl constraint: surgical cell edits only, never a pandas rewrite.
 """
 
+import logging
+import sys
+import uuid
 import numpy as np
 import yfinance as yf
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
 
 from workbook_io import (
+    BASE_PATH,
     find_workbook,
     save_workbook_with_increment,
     write_cell,
@@ -64,40 +57,73 @@ from workbook_io import (
 )
 
 # ---------------------------------------------------------------------------
+# Logging (Wave 8)
+# ---------------------------------------------------------------------------
+
+LOG_DIR = BASE_PATH / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "price_action_intraday.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("price_action_intraday")
+
+_ctx: dict = {}
+_VOCAB_KEYS = ("PHASE=", "ACTION=", "TICKER=", "RUN_ID=", "UID=")
+
+
+def _log(level: str, phase: str, action: str, ticker: str, message: str) -> None:
+    run_id = _ctx.get("run_id", "")
+    uid    = _ctx.get("uid", "")
+    line   = (
+        f"PHASE={phase} ACTION={action} TICKER={ticker} "
+        f"RUN_ID={run_id} UID={uid} | {message}"
+    )
+    for key in _VOCAB_KEYS:
+        if key not in line:
+            log.warning(f"[VOCAB_FAIL] Missing {key}")
+    getattr(log, level.lower())(line)
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 SHEET_NAME = "Universe"
-
-NO_TOUCH = "No Touch"
+NO_TOUCH   = "No Touch"
 
 S_COLUMNS_INTRADAY = [
     "S_Daily_High", "S_Daily_Low", "S_Daily_Open",
     "S_Last_Price", "S_Current_Price", "S_LastTradedTime",
-    "S_1D_Change_%", "S_2D_Change_%", "S_3D_Change_%",
+    "S_1D_Change_Pct", "S_2D_Change_Pct", "S_3D_Change_Pct",  # Wave 4 renames
 ]
 
 FIELD_TYPES = {
-    "S_Daily_High": "number",
-    "S_Daily_Low": "number",
-    "S_Daily_Open": "number",
-    "S_Last_Price": "number",
-    "S_Current_Price": "number",
+    "S_Daily_High":     "number",
+    "S_Daily_Low":      "number",
+    "S_Daily_Open":     "number",
+    "S_Last_Price":     "number",
+    "S_Current_Price":  "number",
     "S_LastTradedTime": "text",
-    "S_1D_Change_%": "percent_scaled",
-    "S_2D_Change_%": "percent_scaled",
-    "S_3D_Change_%": "percent_scaled",
+    "S_1D_Change_Pct":  "percent_scaled",
+    "S_2D_Change_Pct":  "percent_scaled",
+    "S_3D_Change_Pct":  "percent_scaled",
 }
 
 _FIELD_TYPE_FORMATS = {
-    "number": NUMBER_FORMAT_NUMBER,
+    "number":         NUMBER_FORMAT_NUMBER,
     "percent_scaled": NUMBER_FORMAT_PERCENT_SCALED,
-    "text": None,
+    "text":           None,
 }
 
 
 # ---------------------------------------------------------------------------
-# Sheet helpers (same pattern as price_action_4h.py)
+# Sheet helpers
 # ---------------------------------------------------------------------------
 
 def header_map(ws):
@@ -116,13 +142,13 @@ def get_cell(ws, headers, row_idx, col_name, default=None):
 def set_cell(ws, headers, row_idx, col_name, value):
     col = headers.get(col_name)
     if col is None:
-        return  # column not present in sheet -- skip silently, don't crash a run
+        return  # column not in sheet -- skip silently
     field_type = FIELD_TYPES.get(col_name, "text")
     write_cell(ws, row_idx, col, value, number_format=_FIELD_TYPE_FORMATS.get(field_type))
 
 
 # ---------------------------------------------------------------------------
-# Scope filter -- §7a
+# Scope filter
 # ---------------------------------------------------------------------------
 
 def in_scope(ws, headers, row_idx):
@@ -139,29 +165,28 @@ def resolve_ticker(ws, headers, row_idx):
 
 
 # ---------------------------------------------------------------------------
-# yfinance fetch -- S_ columns
+# yfinance fetch
 # ---------------------------------------------------------------------------
 
 def fetch_price_action(symbol):
     """
     One yfinance Ticker object per row, one history() call, no .info[].
-    period="5d" (see module docstring re: deviation from literal "1d") so
-    S_1D/2D/3D_Change_% can be computed. Returns a dict of the 9 S_
-    columns fed by §7a, or None if the pull failed / no data.
+    period="5d" so S_1D/2D/3D_Change_Pct can be computed from prior closes.
+    Returns dict of 9 S_ columns, or None on failure.
     """
     try:
-        t = yf.Ticker(symbol)
+        t    = yf.Ticker(symbol)
         hist = t.history(period="5d")
     except Exception as exc:
-        print(f"[SKIP] {symbol}: yfinance error: {exc}")
+        _log("warning", "FETCH", "YF_ERROR", symbol, f"yfinance error: {exc}")
         return None
 
     if hist.empty:
-        print(f"[SKIP] {symbol}: empty history")
+        _log("warning", "FETCH", "YF_EMPTY", symbol, "empty history")
         return None
 
-    last = hist.iloc[-1]
-    closes = hist["Close"]
+    last       = hist.iloc[-1]
+    closes     = hist["Close"]
     last_price = float(last["Close"])
 
     def pct_change(n):
@@ -173,15 +198,15 @@ def fetch_price_action(symbol):
         return (last_price - prior) / prior * 100
 
     return {
-        "S_Daily_High": float(last["High"]),
-        "S_Daily_Low": float(last["Low"]),
-        "S_Daily_Open": float(last["Open"]),
-        "S_Last_Price": last_price,
+        "S_Daily_High":    float(last["High"]),
+        "S_Daily_Low":     float(last["Low"]),
+        "S_Daily_Open":    float(last["Open"]),
+        "S_Last_Price":    last_price,
         "S_Current_Price": last_price,
         "S_LastTradedTime": hist.index[-1].strftime("%Y-%m-%d %H:%M:%S"),
-        "S_1D_Change_%": pct_change(1),
-        "S_2D_Change_%": pct_change(2),
-        "S_3D_Change_%": pct_change(3),
+        "S_1D_Change_Pct": pct_change(1),
+        "S_2D_Change_Pct": pct_change(2),
+        "S_3D_Change_Pct": pct_change(3),
     }
 
 
@@ -190,18 +215,17 @@ def fetch_price_action(symbol):
 # ---------------------------------------------------------------------------
 
 def run(workbook_path=None):
-    """
-    workbook_path: if omitted, the live .xlsm is resolved by globbing the
-    base path (aborts on 0 matches) and the save at the end rotates the
-    patch-digit filename, moving the old one to Archive/Workbook/. If an
-    explicit path is passed (e.g. by the test harness), it's used as-is
-    and saved in place.
-    """
-    resolved_by_glob = workbook_path is None
-    workbook_path = find_workbook() if resolved_by_glob else Path(workbook_path)
+    _ctx["run_id"] = str(uuid.uuid4())[:8]
+    _ctx["uid"]    = ""
 
-    wb = openpyxl.load_workbook(workbook_path, keep_vba=str(workbook_path).endswith(".xlsm"))
-    ws = wb[SHEET_NAME]
+    start = datetime.now()
+    _log("info", "STARTUP", "RUN_START", "", "price_action_intraday.py starting")
+
+    resolved_by_glob = workbook_path is None
+    workbook_path    = find_workbook() if resolved_by_glob else Path(workbook_path)
+
+    wb      = openpyxl.load_workbook(workbook_path, keep_vba=str(workbook_path).endswith(".xlsm"))
+    ws      = wb[SHEET_NAME]
     headers = header_map(ws)
 
     processed, skipped = 0, 0
@@ -222,6 +246,7 @@ def run(workbook_path=None):
         for col_name in S_COLUMNS_INTRADAY:
             set_cell(ws, headers, row_idx, col_name, s_values[col_name])
 
+        _log("info", "FETCH", "TICKER_DONE", symbol, f"row {row_idx} written")
         processed += 1
 
     if resolved_by_glob:
@@ -229,7 +254,9 @@ def run(workbook_path=None):
     else:
         wb.save(workbook_path)
 
-    print(f"Run complete (intraday). {processed} row(s) updated, {skipped} skipped. Workbook: {workbook_path.name}")
+    elapsed = str(datetime.now() - start).split(".")[0]
+    _log("info", "COMPLETE", "RUN_END", "",
+         f"{processed} row(s) updated, {skipped} skipped. Duration {elapsed}")
     return wb
 
 
