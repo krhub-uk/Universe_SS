@@ -1059,5 +1059,3 @@ def run(workbook_path=None):
 
 if __name__ == "__main__":
     run()
-:
-    run()
