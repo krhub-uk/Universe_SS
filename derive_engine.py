@@ -345,7 +345,7 @@ def run():
     _log("info", "STARTUP", "RUN_START", "", "derive_engine.py starting")
 
     wb_path = find_workbook()
-    wb      = openpyxl.load_workbook(wb_path, keep_vba=True, data_only=True)
+    wb      = openpyxl.load_workbook(wb_path, keep_vba=True)
     ws_uni  = wb["Universe"]
 
     headers = [c.value for c in next(ws_uni.iter_rows(min_row=1, max_row=1))]

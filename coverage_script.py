@@ -405,7 +405,7 @@ def run():
     _log("info", "STARTUP", "RUN_START", "", "coverage_script.py starting")
 
     wb_path = find_workbook()
-    wb      = openpyxl.load_workbook(wb_path, keep_vba=True, data_only=True)
+    wb      = openpyxl.load_workbook(wb_path, keep_vba=True)
 
     _log("info", "COVERAGE", "UNIVERSE_LOAD", "", "Loading Universe invested rows")
     all_rows = load_universe_rows(wb)
