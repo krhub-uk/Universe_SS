@@ -146,7 +146,8 @@ def build_watchlists(ws, headers):
         # TV ticker — S_TV_Ticker preferred, M_Ticker fallback
         tv_ticker = get(row, 'S_TV_Ticker') or ticker_raw
         section   = get(row, 'M_Related_To') or 'Other'
-
+       # if str(ticker_raw).strip().upper() in ('ABNB', 'ADBE'):
+        #    log.info(f"[DIAG] {ticker_raw} | M_Related_To raw={repr(get(row, 'M_Related_To'))} | section={repr(section)} | M_Sleeve={repr(get(row, 'M_Sleeve'))} | M_Sleeve_Watchlist={repr(get(row, 'M_Sleeve_Watchlist'))}")
         # ── Mechanism 1: free-text routing ────────────────────────────────
         # N = exclude from free-text only. Y = no named watchlist (boolean flags handle it).
         # Any other string = literal watchlist name.
@@ -202,7 +203,8 @@ def run():
     wb_path = find_workbook()
     log.info(f"Workbook: {wb_path}")
 
-    wb = openpyxl.load_workbook(wb_path, read_only=True, data_only=True, keep_vba=True)
+    
+    wb = openpyxl.load_workbook(wb_path, data_only=True, keep_vba=True)
     ws = wb['Universe']
     headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
 
