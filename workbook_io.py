@@ -56,7 +56,7 @@ def find_workbook(base_path=BASE_PATH):
             f"[ABORT] No .xlsm workbook found in {base_path}. Expected exactly one."
         )
     if len(matches) > 1:
-        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        matches.sort(key=lambda p: [int(x) for x in re.findall(r'\d+', p.stem)], reverse=True
     return matches[0]
 
 
