@@ -40,6 +40,44 @@ from collections import defaultdict
 
 import openpyxl
 from workbook_io import find_workbook
+from icu_client import push_status, check_gate, resolve_version
+
+import threading
+import uvicorn
+from fastapi import FastAPI, Header, HTTPException
+
+COMPONENT_ID = "universe_ss_sync_tv"
+TRIGGER_PORT = 8001
+
+app = FastAPI()
+
+def run_with_status():
+    from datetime import datetime, timezone
+    run_start = datetime.now(timezone.utc).isoformat()
+    push_status(COMPONENT_ID, "RUNNING", resolve_version(str(find_workbook())),
+                last_run_utc=run_start, trigger="MANUAL")
+    try:
+        total_files = run()
+        push_status(COMPONENT_ID, "IDLE", resolve_version(str(find_workbook())),
+                    last_run_utc=run_start, last_run_result="SUCCESS",
+                    trigger="MANUAL", metrics={"watchlists_synced": total_files})
+    except Exception as e:
+        push_status(COMPONENT_ID, "ERROR", resolve_version(str(find_workbook())),
+                    last_run_utc=run_start, last_run_result="FAILED",
+                    message=str(e))
+                    
+@app.post("/trigger")
+def trigger(x_icu_key: str = Header(None)):
+    if x_icu_key != os.getenv("ICU_API_KEY"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    thread = threading.Thread(target=run_with_status, daemon=True)
+    thread.start()
+    return {"status": "triggered"}
+
+
+def start_server():
+    log.info(f"sync_engine_tv trigger server starting on port {TRIGGER_PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=TRIGGER_PORT, log_level="warning")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -217,6 +255,49 @@ def run():
         f"Ended: {end.strftime('%H:%M:%S')} | Duration: {elapsed} ---"
     )
 
+    return total_files
+
 
 if __name__ == "__main__":
-    run()
+    from datetime import datetime, timezone
+
+    if "--run" in sys.argv:
+        # Direct execution — same as pre-Run-Now behaviour
+        workbook_path = find_workbook()
+        VERSION = resolve_version(str(workbook_path))
+
+        if not check_gate(COMPONENT_ID):
+            push_status(
+                COMPONENT_ID, "PAUSED", VERSION,
+                last_run_result="SKIPPED",
+                trigger="GATE_CHECK"
+            )
+            sys.exit(0)
+
+        run_start = datetime.now(timezone.utc).isoformat()
+        push_status(
+            COMPONENT_ID, "RUNNING", VERSION,
+            last_run_utc=run_start,
+            trigger="MANUAL"
+        )
+
+        try:
+            total_files = run()
+            push_status(
+                COMPONENT_ID, "IDLE", VERSION,
+                last_run_utc=run_start,
+                last_run_result="SUCCESS",
+                trigger="MANUAL",
+                metrics={"watchlists_synced": total_files}
+            )
+        except Exception as e:
+            push_status(
+                COMPONENT_ID, "ERROR", VERSION,
+                last_run_utc=run_start,
+                last_run_result="FAILED",
+                message=str(e)
+            )
+            raise
+    else:
+        # Server mode — start trigger listener, waits for ICU Run Now
+        start_server()

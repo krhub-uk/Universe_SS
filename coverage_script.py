@@ -1,24 +1,28 @@
 """
-coverage_script.py -- COVERAGE tab population
+coverage_script.py -- SECTOR_COVERAGE + ALLOC_COVERAGE tab population
 Spec: 00_Portfolio_Automation_Spec_V5.5.md, Wave 7. Sprint 4.
 
 Runs: weekly cadence (called from run_weekly.sh after derive_engine.py).
 
-Populates the COVERAGE tab with two blocks:
-  1. SECTOR COVERAGE  -- Universe rows grouped by S_Sector, S_Invested="Y" only
-  2. PORTFOLIO COVERAGE -- Universe rows grouped by M_Sleeve, S_Invested="Y" only
+Writes to two separate tabs (user-created in Excel):
+  SECTOR_COVERAGE  -- one row per sector, S_Invested="Y" rows only
+  ALLOC_COVERAGE   -- one row per sleeve, S_Invested="Y" rows only
 
-Clear-and-rewrite on each run. No Excel formula dependency.
+Both tabs: value-only clear on each run (preserves user formatting,
+colours, borders). Headers written to row 1; data from row 2 onwards.
+Named ranges defined for chart anchoring after each write.
 
-SECTOR COVERAGE columns (16 sectors + TOTAL):
-  Sector, Holdings, Market Value GBP, Portfolio %, Cost GBP, G/L GBP, G/L %
+SECTOR_COVERAGE columns (DB-friendly, row 1 headers):
+  sector | holdings_count | mkt_value_gbp | portfolio_pct |
+  cost_gbp | gl_gbp | gl_pct
 
-PORTFOLIO COVERAGE columns (sleeves from Lookups Allocations + TOTAL):
-  Sleeve, Holdings, Market Value GBP, Portfolio %, vs Target, Cost GBP, G/L GBP
+ALLOC_COVERAGE columns (DB-friendly, row 1 headers):
+  sleeve | holdings_count | mkt_value_gbp | portfolio_pct |
+  target_pct | vs_target_pct | cost_gbp | gl_gbp
 
 S_Invested = "Y" filter applied throughout.
 Sleeve target % from Lookups Allocations table: Allocations / Alloc_Pct columns.
-Target stored as raw integer in Lookups (35 = 35%) -- divide by 100 for vs Target.
+target_pct stored as raw % (e.g. 35.0 = 35%); vs_target_pct = portfolio_pct - target_pct.
 
 Wave 8: Structured PHASE/ACTION/TICKER/RUN_ID/UID logging.
 """
@@ -29,7 +33,7 @@ import uuid
 from datetime import datetime
 
 import openpyxl
-from openpyxl.styles import Font
+from openpyxl.workbook.defined_name import DefinedName
 
 from workbook_io import (
     BASE_PATH,
@@ -73,20 +77,31 @@ def _log(level: str, phase: str, action: str, ticker: str, message: str) -> None
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Column definitions (DB-friendly headers)
 # ---------------------------------------------------------------------------
 
-WRITTEN_FONT_SIZE = 12
+# SECTOR_COVERAGE tab
+SECTOR_HEADERS = [
+    "sector", "holdings_count", "mkt_value_gbp", "portfolio_pct",
+    "cost_gbp", "gl_gbp", "gl_pct",
+]
+
+# ALLOC_COVERAGE tab
+ALLOC_HEADERS = [
+    "sleeve", "holdings_count", "mkt_value_gbp", "portfolio_pct",
+    "target_pct", "vs_target_pct", "unallocated_gbp", "cost_gbp", "gl_gbp",
+]
+
+SECTOR_TAB  = "SECTOR_COVERAGE"
+ALLOC_TAB   = "ALLOC_COVERAGE"
+
+SECTOR_NAMED_RANGE = "SECTOR_COVERAGE_DATA"
+ALLOC_NAMED_RANGE  = "ALLOC_COVERAGE_DATA"
 
 
-def header_map(ws):
-    """{header_name: 0-based_index} from row 1 values."""
-    return {
-        cell.value: cell.column - 1
-        for cell in ws[1]
-        if cell.value is not None
-    }
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _safe_float(v, default=0.0):
     if v is None or v == "":
@@ -97,32 +112,63 @@ def _safe_float(v, default=0.0):
         return default
 
 
-def _write(ws, row, col_1based, value):
-    """Thin wrapper: writes value using openpyxl directly, font size 12."""
-    cell = ws.cell(row=row, column=col_1based)
-    cell.value = value
-    f = cell.font
-    cell.font = Font(
-        name=f.name, size=WRITTEN_FONT_SIZE, bold=f.bold, italic=f.italic,
-        vertAlign=f.vertAlign, underline=f.underline, strike=f.strike,
-        color=f.color,
-    )
+def _clear_tab_values(ws):
+    """
+    Value-only clear: set cell values to None from row 2 onwards.
+    Does NOT delete rows — preserves all formatting, colours, borders.
+    Clears up to current max_row so stale rows from prior runs are blanked.
+    """
+    if ws.max_row < 2:
+        return
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.value = None
 
 
-def clear_coverage_tab(ws):
-    """Delete all data rows (keep row 1 header if present, else clear all)."""
-    if ws.max_row > 1:
-        ws.delete_rows(2, ws.max_row - 1)
+def _write_headers(ws, headers):
+    """Write DB-friendly header row (row 1). Direct value set — no font size change."""
+    for col_i, hdr in enumerate(headers, start=1):
+        ws.cell(row=1, column=col_i).value = hdr
+
+
+def _set_named_range(wb, name, tab, first_data_row, last_data_row, num_cols):
+    """
+    Define (or replace) a named range spanning the data area of a tab.
+    Used as a stable anchor for charts regardless of row count changes.
+    """
+    if last_data_row < first_data_row:
+        return  # no data rows — skip
+    last_col_letter = openpyxl.utils.get_column_letter(num_cols)
+    ref = f"'{tab}'!$A${first_data_row}:${last_col_letter}${last_data_row}"
+    defn = DefinedName(name, attr_text=ref)
+    # Remove stale definition if it exists
+    try:
+        if name in wb.defined_names:
+            wb.defined_names.delete(name)
+    except (AttributeError, KeyError):
+        pass
+    try:
+        wb.defined_names[name] = defn
+    except Exception:
+        wb.defined_names.append(defn)
 
 
 # ---------------------------------------------------------------------------
 # Load Universe data
 # ---------------------------------------------------------------------------
 
+def header_map(ws):
+    """{header_name: 0-based_index} from row 1 values."""
+    return {
+        cell.value: cell.column - 1
+        for cell in ws[1]
+        if cell.value is not None
+    }
+
+
 def load_universe_rows(wb):
     """
     Returns a list of dicts for every Universe row where S_Invested = "Y".
-    Keys: S_Sector, M_Sleeve, S_MarketValue_GBP, S_CostBasis, S_PnL_GBP, S_PnL_Pct
     """
     ws = wb["Universe"]
     cm = header_map(ws)
@@ -134,18 +180,16 @@ def load_universe_rows(wb):
 
     rows = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        # S_Invested filter
         invested = row[cm["S_Invested"]] if "S_Invested" in cm else None
         if invested != "Y":
             continue
-
         rows.append({
-            "S_Sector":         row[cm["S_Sector"]]         if "S_Sector"         in cm else None,
-            "M_Sleeve":         row[cm["M_Sleeve"]]         if "M_Sleeve"         in cm else None,
+            "S_Sector":          row[cm["S_Sector"]]          if "S_Sector"          in cm else None,
+            "M_Sleeve":          row[cm["M_Sleeve"]]          if "M_Sleeve"          in cm else None,
             "S_MarketValue_GBP": row[cm["S_MarketValue_GBP"]] if "S_MarketValue_GBP" in cm else None,
-            "S_CostBasis":      row[cm["S_CostBasis"]]      if "S_CostBasis"      in cm else None,
-            "S_PnL_GBP":        row[cm["S_PnL_GBP"]]        if "S_PnL_GBP"        in cm else None,
-            "S_PnL_Pct":        row[cm["S_PnL_Pct"]]        if "S_PnL_Pct"        in cm else None,
+            "S_CostBasis":       row[cm["S_CostBasis"]]       if "S_CostBasis"       in cm else None,
+            "S_PnL_GBP":         row[cm["S_PnL_GBP"]]         if "S_PnL_GBP"         in cm else None,
+            "S_PnL_Pct":         row[cm["S_PnL_Pct"]]         if "S_PnL_Pct"         in cm else None,
         })
 
     return rows
@@ -158,12 +202,11 @@ def load_universe_rows(wb):
 def load_allocations(wb):
     """
     Reads Lookups tab Allocations table by column name.
-    Returns dict: {sleeve_name: alloc_pct_raw} where alloc_pct_raw is 35 (not 0.35).
+    Returns dict: {sleeve_name: target_pct_raw} where target_pct_raw is 35 (= 35%).
     """
     ws   = wb["Lookups"]
     rows = list(ws.iter_rows(values_only=True))
 
-    # Find header row that contains both 'Allocations' and 'Alloc_Pct'
     header_row_idx = None
     for i, row in enumerate(rows):
         if row and "Allocations" in row and "Alloc_Pct" in row:
@@ -175,9 +218,9 @@ def load_allocations(wb):
              "Lookups tab: could not find Allocations/Alloc_Pct header row")
         return {}
 
-    header = rows[header_row_idx]
-    alloc_col = list(header).index("Allocations")
-    pct_col   = list(header).index("Alloc_Pct")
+    header    = list(rows[header_row_idx])
+    alloc_col = header.index("Allocations")
+    pct_col   = header.index("Alloc_Pct")
 
     allocations = {}
     for row in rows[header_row_idx + 1:]:
@@ -211,7 +254,7 @@ def _pnl_pct(cost, pnl_gbp):
 
 
 # ---------------------------------------------------------------------------
-# SECTOR COVERAGE block
+# SECTOR COVERAGE build
 # ---------------------------------------------------------------------------
 
 SECTOR_ORDER = [
@@ -219,178 +262,168 @@ SECTOR_ORDER = [
     "Consumer Defensive", "Energy", "Financial Services",
     "Healthcare", "Industrials", "Real Estate",
     "Technology", "Utilities",
-    # Catch-alls for any others
     "Unknown", "Other",
 ]
 
 
 def build_sector_coverage(all_rows):
     """
-    Returns list of dicts, one per sector, plus TOTAL.
-    Sectors driven by what exists in the data; TOTAL appended last.
+    Returns list of dicts, one per sector, plus TOTAL row.
+    Columns: sector, holdings_count, mkt_value_gbp, portfolio_pct,
+             cost_gbp, gl_gbp, gl_pct
     """
     sector_map = {}
     for row in all_rows:
         sector = str(row["S_Sector"] or "Unknown").strip() or "Unknown"
         sector_map.setdefault(sector, []).append(row)
 
-    # Sort sectors: known order first, then any extras alphabetically
-    known = [s for s in SECTOR_ORDER if s in sector_map]
-    extra = sorted(s for s in sector_map if s not in SECTOR_ORDER)
-    ordered_sectors = known + extra
+    known  = [s for s in SECTOR_ORDER if s in sector_map]
+    extra  = sorted(s for s in sector_map if s not in SECTOR_ORDER)
+    order  = known + extra
 
     total_mkt = sum(_safe_float(r["S_MarketValue_GBP"]) for r in all_rows)
 
     result = []
-    for sector in ordered_sectors:
+    for sector in order:
         rows = sector_map[sector]
         holdings, mkt_val, cost, pnl_gbp = _aggregate(rows)
         portfolio_pct = round(mkt_val / total_mkt * 100, 2) if total_mkt else None
-        pnl_pct       = _pnl_pct(cost, pnl_gbp)
         result.append({
-            "label":         sector,
-            "holdings":      holdings,
-            "mkt_val":       round(mkt_val, 2),
+            "sector":        sector,
+            "holdings_count": holdings,
+            "mkt_value_gbp": round(mkt_val, 2),
             "portfolio_pct": portfolio_pct,
-            "cost":          round(cost, 2),
-            "pnl_gbp":       round(pnl_gbp, 2),
-            "pnl_pct":       pnl_pct,
+            "cost_gbp":      round(cost, 2),
+            "gl_gbp":        round(pnl_gbp, 2),
+            "gl_pct":        _pnl_pct(cost, pnl_gbp),
         })
 
     # TOTAL row
     t_holdings, t_mkt, t_cost, t_pnl = _aggregate(all_rows)
     result.append({
-        "label":         "TOTAL",
-        "holdings":      t_holdings,
-        "mkt_val":       round(t_mkt, 2),
+        "sector":        "TOTAL",
+        "holdings_count": t_holdings,
+        "mkt_value_gbp": round(t_mkt, 2),
         "portfolio_pct": 100.0 if all_rows else None,
-        "cost":          round(t_cost, 2),
-        "pnl_gbp":       round(t_pnl, 2),
-        "pnl_pct":       _pnl_pct(t_cost, t_pnl),
+        "cost_gbp":      round(t_cost, 2),
+        "gl_gbp":        round(t_pnl, 2),
+        "gl_pct":        _pnl_pct(t_cost, t_pnl),
     })
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# PORTFOLIO COVERAGE block
+# ALLOC COVERAGE build
 # ---------------------------------------------------------------------------
 
-def build_portfolio_coverage(all_rows, allocations):
+def build_alloc_coverage(all_rows, allocations):
     """
-    Returns list of dicts, one per sleeve (from Lookups Allocations), plus TOTAL.
-    vs_target = Portfolio% - (Alloc_Pct / 100)
+    Returns list of dicts, one per sleeve, plus TOTAL row.
+    Columns: sleeve, holdings_count, mkt_value_gbp, portfolio_pct,
+             target_pct, vs_target_pct, cost_gbp, gl_gbp
+
+    Sleeve order driven by Lookups Allocations; unknown sleeves appended
+    alphabetically (e.g. DIAMOND will appear if M_Sleeve = "DIAMOND").
+    target_pct = raw % from Alloc_Pct (e.g. 35.0 = 35%).
+    vs_target_pct = portfolio_pct - target_pct.
     """
-    total_mkt = sum(_safe_float(r["S_MarketValue_GBP"]) for r in all_rows)
+    total_mkt  = sum(_safe_float(r["S_MarketValue_GBP"]) for r in all_rows)
 
     sleeve_map = {}
     for row in all_rows:
         sleeve = str(row["M_Sleeve"] or "Unknown").strip() or "Unknown"
         sleeve_map.setdefault(sleeve, []).append(row)
 
-    # Ordered by Lookups Allocations table; extras appended alphabetically
-    known_sleeves = list(allocations.keys())
-    extra_sleeves = sorted(s for s in sleeve_map if s not in allocations)
-    ordered_sleeves = known_sleeves + extra_sleeves
+    known_sleeves  = list(allocations.keys())
+    extra_sleeves  = sorted(s for s in sleeve_map if s not in allocations)
+    ordered        = known_sleeves + extra_sleeves
 
     result = []
-    for sleeve in ordered_sleeves:
+    for sleeve in ordered:
         rows = sleeve_map.get(sleeve, [])
         holdings, mkt_val, cost, pnl_gbp = _aggregate(rows)
         portfolio_pct = round(mkt_val / total_mkt * 100, 2) if total_mkt else None
-        alloc_raw     = allocations.get(sleeve)  # e.g. 35 (= 35%)
-        alloc_pct     = alloc_raw / 100 if alloc_raw is not None else None
-        vs_target     = (
-            round(portfolio_pct - alloc_pct * 100, 2)  # portfolio% - target%
-            if (portfolio_pct is not None and alloc_pct is not None)
+        target_raw    = allocations.get(sleeve)           # e.g. 35.0 (= 35%)
+        vs_target_pct  = (
+            round(portfolio_pct - target_raw, 2)
+            if (portfolio_pct is not None and target_raw is not None)
+            else None
+        )
+        unallocated_gbp = (
+            round((target_raw / 100 * total_mkt) - mkt_val, 2)
+            if target_raw is not None
             else None
         )
         result.append({
-            "label":         sleeve,
-            "holdings":      holdings,
-            "mkt_val":       round(mkt_val, 2),
-            "portfolio_pct": portfolio_pct,
-            "vs_target":     vs_target,
-            "cost":          round(cost, 2),
-            "pnl_gbp":       round(pnl_gbp, 2),
+            "sleeve":          sleeve,
+            "holdings_count":  holdings,
+            "mkt_value_gbp":   round(mkt_val, 2),
+            "portfolio_pct":   portfolio_pct,
+            "target_pct":      target_raw,
+            "vs_target_pct":   vs_target_pct,
+            "unallocated_gbp": unallocated_gbp,
+            "cost_gbp":        round(cost, 2),
+            "gl_gbp":          round(pnl_gbp, 2),
         })
 
     # TOTAL row
     t_holdings, t_mkt, t_cost, t_pnl = _aggregate(all_rows)
     result.append({
-        "label":         "TOTAL",
-        "holdings":      t_holdings,
-        "mkt_val":       round(t_mkt, 2),
-        "portfolio_pct": 100.0 if all_rows else None,
-        "vs_target":     None,
-        "cost":          round(t_cost, 2),
-        "pnl_gbp":       round(t_pnl, 2),
+        "sleeve":          "TOTAL",
+        "holdings_count":  t_holdings,
+        "mkt_value_gbp":   round(t_mkt, 2),
+        "portfolio_pct":   100.0 if all_rows else None,
+        "target_pct":      None,
+        "vs_target_pct":   None,
+        "unallocated_gbp": None,
+        "cost_gbp":        round(t_cost, 2),
+        "gl_gbp":          round(t_pnl, 2),
     })
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Write to COVERAGE tab
+# Write helpers
 # ---------------------------------------------------------------------------
 
-def write_coverage_tab(wb, sector_rows, portfolio_rows):
+def _write_tab(wb, tab_name, headers, data_rows, named_range):
     """
-    Clear and rewrite COVERAGE tab.
-    Layout:
-      Row 1: blank (or existing header preserved -- we clear all and rewrite)
-      Row 2: SECTOR COVERAGE header
-      Row 3..N: sector data
-      Row N+1: blank separator
-      Row N+2: PORTFOLIO COVERAGE header
-      Row N+3..M: portfolio data
+    Generic write-to-tab:
+      1. Value-only clear (preserve formatting)
+      2. Write DB-friendly headers to row 1 (value only, no font change)
+      3. Write data rows 2..N using write_cell (conditional, preserves alignment)
+      4. Define named range over data area (rows 2..N)
     """
-    ws = wb["COVERAGE"]
+    if tab_name not in wb.sheetnames:
+        _log("warning", "COVERAGE", "TAB_MISSING", "",
+             f"Tab '{tab_name}' not found — skipping. Create it in Excel first.")
+        return
 
-    # Clear all content
-    ws.delete_rows(1, ws.max_row)
+    ws = wb[tab_name]
 
-    current_row = 1
+    # Step 1: value-only clear
+    _clear_tab_values(ws)
 
-    # --- SECTOR COVERAGE ---
-    sector_headers = [
-        "Sector", "Holdings", "Market Value GBP",
-        "Portfolio %", "Cost GBP", "G/L GBP", "G/L %",
-    ]
-    for col_i, hdr in enumerate(sector_headers, start=1):
-        _write(ws, current_row, col_i, hdr)
-    current_row += 1
+    # Step 2: headers (direct value assignment — don't alter header row formatting)
+    _write_headers(ws, headers)
 
-    for row_data in sector_rows:
-        _write(ws, current_row, 1, row_data["label"])
-        _write(ws, current_row, 2, row_data["holdings"])
-        _write(ws, current_row, 3, row_data["mkt_val"])
-        _write(ws, current_row, 4, row_data["portfolio_pct"])
-        _write(ws, current_row, 5, row_data["cost"])
-        _write(ws, current_row, 6, row_data["pnl_gbp"])
-        _write(ws, current_row, 7, row_data["pnl_pct"])
+    # Step 3: data rows
+    data_row_start = 2
+    current_row    = data_row_start
+    for row_data in data_rows:
+        for col_i, key in enumerate(headers, start=1):
+            write_cell(ws, current_row, col_i, row_data.get(key))
         current_row += 1
 
-    current_row += 1  # blank separator row
+    last_data_row = current_row - 1
 
-    # --- PORTFOLIO COVERAGE ---
-    portfolio_headers = [
-        "Sleeve", "Holdings", "Market Value GBP",
-        "Portfolio %", "vs Target", "Cost GBP", "G/L GBP",
-    ]
-    for col_i, hdr in enumerate(portfolio_headers, start=1):
-        _write(ws, current_row, col_i, hdr)
-    current_row += 1
-
-    for row_data in portfolio_rows:
-        _write(ws, current_row, 1, row_data["label"])
-        _write(ws, current_row, 2, row_data["holdings"])
-        _write(ws, current_row, 3, row_data["mkt_val"])
-        _write(ws, current_row, 4, row_data["portfolio_pct"])
-        _write(ws, current_row, 5, row_data["vs_target"])
-        _write(ws, current_row, 6, row_data["cost"])
-        _write(ws, current_row, 7, row_data["pnl_gbp"])
-        current_row += 1
+    # Step 4: named range
+    _set_named_range(wb, named_range, tab_name,
+                     data_row_start, last_data_row, len(headers))
+    _log("info", "COVERAGE", "NAMED_RANGE", "",
+         f"{named_range} => '{tab_name}'!$A${data_row_start}:${openpyxl.utils.get_column_letter(len(headers))}${last_data_row}")
 
 
 # ---------------------------------------------------------------------------
@@ -409,27 +442,31 @@ def run():
 
     _log("info", "COVERAGE", "UNIVERSE_LOAD", "", "Loading Universe invested rows")
     all_rows = load_universe_rows(wb)
-    _log("info", "COVERAGE", "UNIVERSE_LOAD", "", f"{len(all_rows)} S_Invested=Y rows")
+    _log("info", "COVERAGE", "UNIVERSE_LOAD", "", f"{len(all_rows)} S_Invested=Y rows loaded")
 
     _log("info", "COVERAGE", "ALLOC_LOAD", "", "Loading Lookups Allocations table")
     allocations = load_allocations(wb)
     _log("info", "COVERAGE", "ALLOC_LOAD", "", f"{len(allocations)} sleeve allocations loaded")
 
-    _log("info", "COVERAGE", "SECTOR_BUILD", "", "Building SECTOR COVERAGE block")
+    # Build data
+    _log("info", "COVERAGE", "SECTOR_BUILD", "", "Building SECTOR_COVERAGE data")
     sector_rows = build_sector_coverage(all_rows)
 
-    _log("info", "COVERAGE", "PORTFOLIO_BUILD", "", "Building PORTFOLIO COVERAGE block")
-    portfolio_rows = build_portfolio_coverage(all_rows, allocations)
+    _log("info", "COVERAGE", "ALLOC_BUILD", "", "Building ALLOC_COVERAGE data")
+    alloc_rows = build_alloc_coverage(all_rows, allocations)
 
-    _log("info", "COVERAGE", "WRITE_START", "", "Writing COVERAGE tab (clear-and-rewrite)")
-    write_coverage_tab(wb, sector_rows, portfolio_rows)
+    # Write tabs
+    _log("info", "COVERAGE", "WRITE_START", "", f"Writing {SECTOR_TAB}")
+    _write_tab(wb, SECTOR_TAB, SECTOR_HEADERS, sector_rows, SECTOR_NAMED_RANGE)
+
+    _log("info", "COVERAGE", "WRITE_START", "", f"Writing {ALLOC_TAB}")
+    _write_tab(wb, ALLOC_TAB, ALLOC_HEADERS, alloc_rows, ALLOC_NAMED_RANGE)
 
     save_workbook_with_increment(wb, wb_path)
 
     elapsed = str(datetime.now() - start).split(".")[0]
     _log("info", "COMPLETE", "RUN_END", "",
-         f"{len(sector_rows)} sector rows, {len(portfolio_rows)} portfolio rows. "
-         f"Duration {elapsed}")
+         f"{len(sector_rows)} sector rows, {len(alloc_rows)} alloc rows. Duration {elapsed}")
 
 
 if __name__ == "__main__":

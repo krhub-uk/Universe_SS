@@ -1,0 +1,13 @@
+[Unit]
+Description=Universe SS sync_engine_tv trigger server
+After=network.target
+
+[Service]
+User=kyle
+WorkingDirectory=/opt/dev/universe_SS
+ExecStart=/opt/dev/universe_SS/venv/bin/python3 /opt/dev/universe_SS/sync_engine_tv.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

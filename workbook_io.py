@@ -17,7 +17,7 @@ import re
 import shutil
 from pathlib import Path
 
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font
 
 BASE_PATH = Path(__file__).resolve().parent
 
@@ -265,6 +265,14 @@ def write_cell(ws, row, column, value, number_format=None):
         name=f.name, size=WRITTEN_FONT_SIZE, bold=f.bold, italic=f.italic,
         vertAlign=f.vertAlign, underline=f.underline, strike=f.strike,
         color=f.color,
+    )
+    # Preserve alignment set in Excel (centre, left, right etc.) — Sprint 4 fix.
+    a = cell.alignment
+    cell.alignment = Alignment(
+        horizontal=a.horizontal, vertical=a.vertical,
+        wrap_text=a.wrap_text, shrink_to_fit=a.shrink_to_fit,
+        indent=a.indent, text_rotation=a.text_rotation,
+        readingOrder=a.readingOrder,
     )
     if number_format is not None:
         cell.number_format = number_format

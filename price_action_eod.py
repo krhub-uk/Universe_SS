@@ -80,7 +80,7 @@ import sys
 import uuid
 import numpy as np
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import openpyxl
@@ -97,6 +97,9 @@ from workbook_io import (
     NUMBER_FORMAT_PERCENT_SCALED,
     NUMBER_FORMAT_PERCENT_FRACTION,
 )
+from icu_client import push_status, check_gate, resolve_version
+
+COMPONENT_ID = "universe_ss_eod"
 
 # ---------------------------------------------------------------------------
 # Logging (Wave 8)
@@ -490,6 +493,9 @@ def run(workbook_path=None, run_date=None):
 
         processed += 1
 
+    _ctx["processed"] = processed
+    _ctx["skipped"] = skipped
+
     if resolved_by_glob:
         workbook_path = save_workbook_with_increment(wb, workbook_path)
     else:
@@ -511,4 +517,46 @@ def run(workbook_path=None, run_date=None):
 
 
 if __name__ == "__main__":
-    run()
+    workbook_path = find_workbook()
+    VERSION = resolve_version(str(workbook_path))
+
+    if not check_gate(COMPONENT_ID):
+        push_status(
+            COMPONENT_ID, "PAUSED", VERSION,
+            last_run_result="SKIPPED",
+            trigger="GATE_CHECK"
+        )
+        sys.exit(0)
+
+    run_start = datetime.now(timezone.utc).isoformat()
+    push_status(
+        COMPONENT_ID, "RUNNING", VERSION,
+        last_run_utc=run_start,
+        trigger="SCHEDULED"
+    )
+
+    try:
+        run()
+        processed = _ctx.get("processed", 0)
+        skipped = _ctx.get("skipped", 0)
+        if skipped == 0:
+            result = "SUCCESS"
+        elif processed > 0:
+            result = "PARTIAL"
+        else:
+            result = "DEGRADED"
+        push_status(
+            COMPONENT_ID, "IDLE", VERSION,
+            last_run_utc=run_start,
+            last_run_result=result,
+            trigger="SCHEDULED",
+            metrics={"rows_processed": processed, "rows_failed": skipped}
+        )
+    except Exception as e:
+        push_status(
+            COMPONENT_ID, "ERROR", VERSION,
+            last_run_utc=run_start,
+            last_run_result="FAILED",
+            message=str(e)
+        )
+        raise
