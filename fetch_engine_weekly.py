@@ -227,8 +227,12 @@ def populate_sector_from_lookups(wb, ws_universe):
         m_ticker = get_cell(ws_universe, uni_headers, row_idx, "M_Ticker")
         if not m_ticker:
             continue
-        sector = sector_map.get(str(m_ticker).strip(), "")
-        set_cell(ws_universe, uni_headers, row_idx, "S_Sector", sector)
+            sector = sector_map.get(str(m_ticker).strip())
+            if sector:
+                set_cell(ws_universe, uni_headers, row_idx, "S_Sector", sector)
+                #sector = sector_map.get(str(m_ticker).strip(), "")
+                #set_cell(ws_universe, uni_headers, row_idx, "S_Sector", sector)
+        
         if sector:
             updated += 1
 
