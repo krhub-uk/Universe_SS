@@ -63,6 +63,7 @@ fi
 
 # 7. venv activation + python execution
 source "$BASE_DIR/venv/bin/activate"
+python3 /opt/dev/universe_ss/preflight_inputs.py >> "$LOG_FILE" 2>&1
 python3 "$BASE_DIR/price_action_eod.py" >> "$LOG_FILE" 2>&1
 SCRIPT_EXIT=$?
 
