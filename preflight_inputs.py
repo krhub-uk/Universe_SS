@@ -13,12 +13,12 @@ import logging
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INPUTS_DIR = "/opt/dev/universe_ss/Inputs"
+INPUTS_DIR = "/opt/dev/universe_SS/Inputs"
 
 GDRIVE_BC = "gdrive:Claude/TradingUniverse/input/BC"
 GDRIVE_HL = "gdrive:Claude/TradingUniverse/input/HL"
 
-LOG_PATH = "/var/log/universe_ss/preflight_inputs.log"
+LOG_PATH = "/var/log/universe_SS/preflight_inputs.log"
 
 # Expected filename fragments — partial match so date-stamped filenames still match
 BC_PATTERN = "bc"
