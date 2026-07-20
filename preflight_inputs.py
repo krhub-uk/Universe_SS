@@ -2,27 +2,32 @@
 """
 preflight_inputs.py
 -------------------
-Checks /opt/dev/universe_ss/Inputs/ for BC and HL CSVs.
-If either is missing, pulls from GDrive via rclone.
-Intended to run before fetch_engine_weekly.py / price_action_eod.py.
+Checks Inputs/BC/ and Inputs/HL/ for CSVs.
+If either folder is empty, pulls from GDrive via rclone.
+Intended to run before price_action_eod.py.
+
+GDrive sources:
+  gdrive:Claude/TradingUniverse/input/BC  ->  Inputs/BC/
+  gdrive:Claude/TradingUniverse/input/HL  ->  Inputs/HL/
+
+portfolio_csv_ingestion.py handles individual file presence
+gracefully, so preflight only needs to confirm files exist —
+not which specific ones.
 """
 
 import os
 import subprocess
 import logging
-from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INPUTS_DIR = "/opt/dev/universe_SS/Inputs"
+BASE_INPUTS  = "/opt/dev/universe_SS/Inputs"
+INPUTS_BC    = f"{BASE_INPUTS}/BC"
+INPUTS_HL    = f"{BASE_INPUTS}/HL"
 
-GDRIVE_BC = "gdrive:Claude/TradingUniverse/input/BC"
-GDRIVE_HL = "gdrive:Claude/TradingUniverse/input/HL"
+GDRIVE_BC    = "gdrive:Claude/TradingUniverse/input/BC"
+GDRIVE_HL    = "gdrive:Claude/TradingUniverse/input/HL"
 
-LOG_PATH = "/var/log/universe_SS/preflight_inputs.log"
-
-# Expected filename fragments — partial match so date-stamped filenames still match
-BC_PATTERN = "bc"
-HL_PATTERN = "hl"
+LOG_PATH     = "/var/log/universe_SS/preflight_inputs.log"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -36,22 +41,16 @@ log = logging.getLogger(__name__)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def find_csv(directory: str, pattern: str) -> str | None:
-    """Return first CSV in directory whose lowercase name contains pattern."""
+def has_csv(directory: str) -> bool:
+    """Return True if directory contains at least one CSV file."""
     try:
-        for f in os.listdir(directory):
-            if f.lower().endswith(".csv") and pattern in f.lower():
-                return f
+        return any(f.lower().endswith(".csv") for f in os.listdir(directory))
     except FileNotFoundError:
-        pass
-    return None
+        return False
 
 
 def pull_from_gdrive(gdrive_path: str, local_dir: str, label: str) -> bool:
-    """
-    Pull CSV(s) from GDrive folder into local_dir using rclone copy.
-    Returns True on success.
-    """
+    os.makedirs(local_dir, exist_ok=True)
     log.info(f"{label}: pulling from {gdrive_path} → {local_dir}")
     result = subprocess.run(
         ["rclone", "copy", gdrive_path, local_dir, "--include", "*.csv"],
@@ -69,36 +68,36 @@ def pull_from_gdrive(gdrive_path: str, local_dir: str, label: str) -> bool:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> int:
     log.info("=== Preflight check started ===")
-    os.makedirs(INPUTS_DIR, exist_ok=True)
 
     errors = []
 
-    for label, pattern, gdrive_path in [
-        ("BC", BC_PATTERN, GDRIVE_BC),
-        ("HL", HL_PATTERN, GDRIVE_HL),
+    for label, local_dir, gdrive_path in [
+        ("BC", INPUTS_BC, GDRIVE_BC),
+        ("HL", INPUTS_HL, GDRIVE_HL),
     ]:
-        found = find_csv(INPUTS_DIR, pattern)
-        if found:
-            log.info(f"{label}: found locally → {found}")
+        os.makedirs(local_dir, exist_ok=True)
+
+        if has_csv(local_dir):
+            files = [f for f in os.listdir(local_dir) if f.lower().endswith(".csv")]
+            log.info(f"{label}: found locally — {', '.join(files)}")
         else:
-            log.warning(f"{label}: not found locally — attempting GDrive pull")
-            ok = pull_from_gdrive(gdrive_path, INPUTS_DIR, label)
+            log.warning(f"{label}: no CSVs found locally — attempting GDrive pull")
+            ok = pull_from_gdrive(gdrive_path, local_dir, label)
             if ok:
-                # Confirm file arrived
-                found = find_csv(INPUTS_DIR, pattern)
-                if found:
-                    log.info(f"{label}: confirmed after pull → {found}")
+                if has_csv(local_dir):
+                    files = [f for f in os.listdir(local_dir) if f.lower().endswith(".csv")]
+                    log.info(f"{label}: confirmed after pull — {', '.join(files)}")
                 else:
-                    log.error(f"{label}: pull reported success but file still missing")
+                    log.error(f"{label}: pull reported success but no CSVs arrived")
                     errors.append(label)
             else:
                 errors.append(label)
 
     if errors:
-        log.error(f"=== Preflight FAILED — missing: {', '.join(errors)} ===")
+        log.error(f"=== Preflight FAILED — no CSVs in: {', '.join(errors)} ===")
         return 1
 
-    log.info("=== Preflight passed — all inputs present ===")
+    log.info("=== Preflight passed — all input folders populated ===")
     return 0
 
 
